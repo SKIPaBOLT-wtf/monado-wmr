@@ -1,0 +1,17 @@
+name: G2 source regressions
+on:
+  workflow_dispatch:
+  push:
+    branches: [g2-stability]
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  offline-source:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: HID routing and immutable pose-bias binding
+        run: |
+          python3 tests/g2/test_hid_preservation.py
+          python3 tests/g2/test_bias_binding.py

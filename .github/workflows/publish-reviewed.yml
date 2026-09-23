@@ -1,0 +1,37 @@
+name: Publish reviewed source snapshot
+on:
+  push:
+    branches: [publish-reviewed-snapshot]
+    paths: [.github/workflows/publish-reviewed.yml]
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  publish:
+    if: github.repository == 'SKIPaBOLT-wtf/monado-wmr'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 0
+      - name: Verify reviewed bundle and fast-forward the continuation
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BUNDLE_BLOB: 3ba0ee9063ba59aaa670c94412dda8174c681026
+          BUNDLE_SHA256: fa38bb69c656f07ce5146e26910a62c7b41bbace452682e2439cee47ee2c25b4
+          TARGET_COMMIT: 296c50e8822a047bc960fa31699eb6f99699a62c
+          EXPECTED_BASE: 431ee47b89565ce6cbf57ea43f3dad6d0361ec44
+        shell: bash
+        run: |
+          set -euo pipefail
+          bundle="$RUNNER_TEMP/reviewed.bundle"
+          gh api "repos/$GITHUB_REPOSITORY/git/blobs/$BUNDLE_BLOB" --jq .content | base64 --decode > "$bundle"
+          printf '%s  %s\n' "$BUNDLE_SHA256" "$bundle" | sha256sum --check -
+          git bundle verify "$bundle"
+          git fetch "$bundle" refs/heads/g2-stability
+          test "$(git rev-parse FETCH_HEAD)" = "$TARGET_COMMIT"
+          git merge-base --is-ancestor "$EXPECTED_BASE" "$TARGET_COMMIT"
+          current=$(git ls-remote origin refs/heads/g2-stability | cut -f1)
+          test "$current" = "$EXPECTED_BASE"
+          git push origin "$TARGET_COMMIT:refs/heads/g2-stability"
