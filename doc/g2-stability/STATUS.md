@@ -23,7 +23,7 @@ The source retains the G2 display/90 Hz and native SteamVR path and public contr
 4. Controller aim/grip/SteamVR Home alignment remains physically unverified. Manufacturer/public profile transforms and application bindings are evidence; ad hoc inward/downward adjustments are experiments, not factory truth.
 5. A room/floor origin can correct a constant room placement error, but cannot repair raw visual-inertial drift. Do not hide a drifting tracker with repeated recentering.
 6. The Windows investigation compared specific calibration and driver evidence; it did not reproduce all proprietary Microsoft fusion/filtering mechanisms.
-7. Rebuilt Basalt binaries diverged on a recording where the installed upstream release remained bounded. Both the unmodified rebuild control and optional exporter failed. Do not install either failed rebuild or attribute this solely to the exporter.
+7. The GNU ld Basalt rebuilds diverged on a recording where the installed upstream release remained bounded. In the companion `2026-09-23-basalt-linker-parity` iteration, mold 2.40.4 relinks of the same compiled objects matched all 2,553 release rows on that input. The old GNU ld artifacts remain rejected, and the mold-linked test outputs are not deployment-qualified. Do not enable the optional gyro-bias consumer from this offline result.
 
 ## Default policy
 
