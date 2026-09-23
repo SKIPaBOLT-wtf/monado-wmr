@@ -1,5 +1,6 @@
 name: G2 source regressions
 on:
+  workflow_dispatch:
   push:
     branches: [g2-stability]
   pull_request:
