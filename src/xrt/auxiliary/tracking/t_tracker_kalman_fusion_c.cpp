@@ -63,6 +63,14 @@ kalman_fusion_process_imu_data(KalmanFusionInterfaceWrapper *wrapper,
 }
 
 void
+kalman_fusion_process_idle_status(KalmanFusionInterfaceWrapper *wrapper, timepoint_ns timestamp_ns)
+{
+	if (wrapper != nullptr) {
+		wrapper->fusion->process_idle_status(timestamp_ns);
+	}
+}
+
+void
 kalman_fusion_process_pose(KalmanFusionInterfaceWrapper *wrapper,
                            const struct xrt_pose_sample *sample,
                            const struct xrt_vec3 *position_variance_optional,
@@ -284,4 +292,46 @@ kalman_fusion_debug_get_oov_report(struct KalmanFusionInterfaceWrapper *wrapper,
 	}
 	return wrapper->fusion->debug_get_oov_report(timestamp_ns, hmd_world_pose, out_debug);
 }
+}
+
+extern "C" void
+kalman_fusion_get_prediction_with_presentation(struct KalmanFusionInterfaceWrapper *wrapper,
+    int64_t timestamp_ns, struct xrt_space_relation *out_relation,
+    const struct xrt_pose *hmd_world_pose, struct xrt_pose *out_from_raw, uint64_t *out_generation)
+{
+    if (!wrapper) return;
+    wrapper->fusion->get_prediction(timestamp_ns, out_relation, hmd_world_pose, out_from_raw, out_generation, true);
+}
+
+extern "C" void
+kalman_fusion_re_anchor_world_with_presentation(struct KalmanFusionInterfaceWrapper *wrapper,
+    const struct xrt_pose *delta, const struct xrt_vec3 *new_raw_pivot,
+    int64_t publication_ns, double gyro_dps, double speed_mps)
+{
+    if (!wrapper) return;
+    wrapper->fusion->re_anchor_world_with_presentation(delta, new_raw_pivot, publication_ns, gyro_dps, speed_mps);
+}
+
+
+bool
+kalman_fusion_get_estimator_prior(struct KalmanFusionInterfaceWrapper *wrapper, int64_t timestamp_ns,
+                                 struct t_estimator_prior *out_prior)
+{
+	return wrapper != nullptr && wrapper->fusion->get_estimator_prior(timestamp_ns, out_prior);
+}
+
+uint64_t
+kalman_fusion_get_world_generation(struct KalmanFusionInterfaceWrapper *wrapper)
+{
+	return wrapper != nullptr ? wrapper->fusion->get_world_generation() : UINT64_MAX;
+}
+
+bool
+kalman_fusion_predict_led_gate_from_prior(const struct t_estimator_prior *prior,
+                                         const struct kalman_led_observation *obs,
+                                         const struct kalman_led_camera_view *view,
+                                         float out_zhat[2], float out_S[4])
+{
+	return prior != nullptr && obs != nullptr && view != nullptr &&
+	    xrt::auxiliary::tracking::predict_led_gate_from_prior(*prior, *obs, *view, out_zhat, out_S);
 }

@@ -11,6 +11,7 @@
 #pragma once
 
 #include "vit/vit_interface.h"
+#include "vit/vit_g2_bias_v1.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -53,6 +54,7 @@ struct t_vit_bundle
 	PFN_vit_pose_get_data pose_get_data;
 	PFN_vit_pose_get_timing pose_get_timing;
 	PFN_vit_pose_get_features pose_get_features;
+	PFN_vit_g2_pose_get_imu_bias_v1 g2_pose_get_imu_bias_v1; //!< Optional, never required for ordinary VIT.
 };
 
 /*!

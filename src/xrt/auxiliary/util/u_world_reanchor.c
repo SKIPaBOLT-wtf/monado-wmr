@@ -320,3 +320,96 @@ u_world_reanchor_get_magnitude(const struct u_world_reanchor *wr, double *out_an
 		*out_pos_m = sqrt(wr->dp[0] * wr->dp[0] + wr->dp[1] * wr->dp[1] + wr->dp[2] * wr->dp[2]);
 	}
 }
+
+
+static void
+wr_rotate(const double q[4], const double v[3], double out[3])
+{
+    const double tx = 2.0 * (q[1] * v[2] - q[2] * v[1]);
+    const double ty = 2.0 * (q[2] * v[0] - q[0] * v[2]);
+    const double tz = 2.0 * (q[0] * v[1] - q[1] * v[0]);
+    out[0] = v[0] + q[3] * tx + q[1] * tz - q[2] * ty;
+    out[1] = v[1] + q[3] * ty + q[2] * tx - q[0] * tz;
+    out[2] = v[2] + q[3] * tz + q[0] * ty - q[1] * tx;
+}
+
+/* Exact solution of y'=-min(cap,y/tau), with the existing glide parameters. */
+static double
+wr_decay(double magnitude, double cap, double tau, double elapsed)
+{
+    if (magnitude <= 0.0 || elapsed <= 0.0) return magnitude;
+    const double linear_time = fmax(0.0, (magnitude - cap * tau) / cap);
+    if (elapsed < linear_time) return magnitude - cap * elapsed;
+    return fmin(magnitude, cap * tau) * exp(-(elapsed - linear_time) / tau);
+}
+
+void
+u_world_reanchor_compensation_init(struct u_world_reanchor_compensation *s)
+{
+    memset(s, 0, sizeof(*s));
+    s->dq[3] = 1.0;
+}
+
+static void
+wr_compensation_eval(const struct u_world_reanchor_compensation *s, int64_t when_ns,
+                     double q[4], double t[3])
+{
+    q[0] = q[1] = q[2] = t[0] = t[1] = t[2] = 0.0;
+    q[3] = 1.0;
+    if (!s->active) return;
+    const struct u_world_reanchor_params *prm = &u_world_reanchor_default_params;
+    const double elapsed = when_ns > s->anchor_ns ? (double)(when_ns - s->anchor_ns) * 1e-9 : 0.0;
+    const double ang = quat_angle_deg(s->dq);
+    const double pos = sqrt(s->dp[0]*s->dp[0]+s->dp[1]*s->dp[1]+s->dp[2]*s->dp[2]);
+    const double a = wr_decay(ang, s->angular_cap_dps, prm->tau_s, elapsed);
+    const double p = wr_decay(pos, s->linear_cap_mps, prm->tau_s, elapsed);
+    if (a < prm->snap_ang_deg && p < prm->snap_pos_m) return;
+    quat_scale_angle(s->dq, a, q);
+    double rp[3]; wr_rotate(q, s->pivot, rp);
+    const double k = pos > 0.0 ? p / pos : 0.0;
+    for (int i=0;i<3;i++) t[i] = s->pivot[i] + k*s->dp[i] - rp[i];
+}
+
+void
+u_world_reanchor_compensation_evaluate(const struct u_world_reanchor_compensation *s,
+                                      int64_t when_ns, struct xrt_pose *out)
+{
+    double q[4], t[3]; wr_compensation_eval(s, when_ns, q, t);
+    out->orientation = (struct xrt_quat){(float)q[0],(float)q[1],(float)q[2],(float)q[3]};
+    out->position = (struct xrt_vec3){(float)t[0],(float)t[1],(float)t[2]};
+}
+
+bool
+u_world_reanchor_compensation_rebase(struct u_world_reanchor_compensation *s,
+                                    const struct xrt_pose *delta, const struct xrt_vec3 *pivot,
+                                    int64_t when_ns, double gyro_dps, double speed_mps)
+{
+    if (!delta || !pivot || (s->generation != 0 && when_ns <= s->anchor_ns) || when_ns <= 0 ||
+        !isfinite(gyro_dps) || !isfinite(speed_mps) || gyro_dps < 0 || speed_mps < 0) return false;
+    double d[4] = {delta->orientation.x,delta->orientation.y,delta->orientation.z,delta->orientation.w};
+    const double v[3] = {delta->position.x,delta->position.y,delta->position.z};
+    const double h[3] = {pivot->x,pivot->y,pivot->z};
+    double n=0; for(int i=0;i<4;i++){if(!isfinite(d[i]))return false;n+=d[i]*d[i];}
+    for(int i=0;i<3;i++)if(!isfinite(v[i])||!isfinite(h[i]))return false;
+    if(n < 1e-12)return false;
+    n=sqrt(n);for(int i=0;i<4;i++)d[i]/=n;
+    double old_q[4],old_t[3];wr_compensation_eval(s,when_ns,old_q,old_t);
+    const double inv_q[4]={-d[0],-d[1],-d[2],d[3]};
+    double q[4],inv_v[3],t[3];qmul(old_q,inv_q,q);wr_rotate(inv_q,v,inv_v);
+    for(int i=0;i<3;i++)inv_v[i]=-inv_v[i];
+    wr_rotate(old_q,inv_v,t);for(int i=0;i<3;i++)t[i]+=old_t[i];
+    double rh[3];wr_rotate(q,h,rh);
+    const struct u_world_reanchor_params *prm=&u_world_reanchor_default_params;
+    double dp[3];for(int i=0;i<3;i++)dp[i]=rh[i]+t[i]-h[i];
+    const double ang=quat_angle_deg(q);
+    const double pos=sqrt(dp[0]*dp[0]+dp[1]*dp[1]+dp[2]*dp[2]);
+    if(ang > prm->cap_ang_deg)quat_scale_angle(q,prm->cap_ang_deg,q);
+    const double k=pos > prm->cap_pos_m ? prm->cap_pos_m/pos : 1.0;
+    memcpy(s->dq,q,sizeof(q));memcpy(s->pivot,h,sizeof(h));
+    for(int i=0;i<3;i++)s->dp[i]=dp[i]*k;
+    s->anchor_ns=when_ns;s->generation++;
+    s->angular_cap_dps=prm->omega0_dps+prm->beta_w*gyro_dps;
+    s->linear_cap_mps=prm->v0_mps+prm->beta_v*speed_mps;
+    s->active=ang > 0.0 || pos > 0.0;
+    return true;
+}

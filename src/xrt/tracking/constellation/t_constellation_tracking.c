@@ -719,13 +719,46 @@ constellation_tracked_device_connection_notify_frame(struct t_constellation_trac
 	os_mutex_unlock(&ctdc->lock);
 }
 
+/* ctdc->lock is the raw-world publication barrier. Keep validation and each fold/cache callback
+ * in one critical section; a frozen old-frame pose must never enter a newly rebased estimator. */
+static bool
+prior_epoch_matches_locked(struct t_constellation_tracked_device_connection *ctdc,
+                           const struct t_estimator_prior *prior)
+{
+	return prior == NULL || (ctdc->cb->validate_prior_epoch &&
+	                        ctdc->cb->validate_prior_epoch(ctdc->xdev, prior));
+}
+
+static bool
+constellation_tracked_device_connection_prior_current(struct t_constellation_tracked_device_connection *ctdc,
+                                                      const struct t_estimator_prior *prior)
+{
+	os_mutex_lock(&ctdc->lock);
+	bool ret = !ctdc->disconnected && prior_epoch_matches_locked(ctdc, prior);
+	os_mutex_unlock(&ctdc->lock);
+	return ret;
+}
+
+static bool
+constellation_tracked_device_connection_get_estimator_prior(struct t_constellation_tracked_device_connection *ctdc,
+                                                            timepoint_ns when_ns, struct t_estimator_prior *out)
+{
+	if (!ctdc) { return false; }
+	os_mutex_lock(&ctdc->lock);
+	bool ret = !ctdc->disconnected && ctdc->cb->get_estimator_prior &&
+	           ctdc->cb->get_estimator_prior(ctdc->xdev, when_ns, out);
+	os_mutex_unlock(&ctdc->lock);
+	return ret;
+}
+
 static void
 constellation_tracked_device_connection_notify_pose(struct t_constellation_tracked_device_connection *ctdc,
                                                     timepoint_ns frame_mono_ns,
+                                                    const struct t_estimator_prior *prior,
                                                     const struct xrt_pose *pose)
 {
 	os_mutex_lock(&ctdc->lock);
-	if (!ctdc->disconnected && ctdc->cb->push_observed_pose) {
+	if (!ctdc->disconnected && prior_epoch_matches_locked(ctdc, prior) && ctdc->cb->push_observed_pose) {
 		ctdc->cb->push_observed_pose(ctdc->xdev, frame_mono_ns, pose);
 	}
 	os_mutex_unlock(&ctdc->lock);
@@ -734,12 +767,13 @@ constellation_tracked_device_connection_notify_pose(struct t_constellation_track
 static void
 constellation_tracked_device_connection_notify_position(struct t_constellation_tracked_device_connection *ctdc,
                                                         timepoint_ns frame_mono_ns,
+                                                    const struct t_estimator_prior *prior,
                                                         const struct xrt_vec3 *position,
                                                         const struct xrt_vec3 *position_variance,
                                                         bool refresh_optical_anchor)
 {
 	os_mutex_lock(&ctdc->lock);
-	if (!ctdc->disconnected && ctdc->cb->push_observed_position) {
+	if (!ctdc->disconnected && prior_epoch_matches_locked(ctdc, prior) && ctdc->cb->push_observed_position) {
 		ctdc->cb->push_observed_position(ctdc->xdev, frame_mono_ns, position, position_variance,
 		                                  refresh_optical_anchor);
 	}
@@ -749,10 +783,11 @@ constellation_tracked_device_connection_notify_position(struct t_constellation_t
 static void
 constellation_tracked_device_connection_cache_pnp_pose_candidate(struct t_constellation_tracked_device_connection *ctdc,
                                                                 timepoint_ns frame_mono_ns,
+                                                    const struct t_estimator_prior *prior,
                                                                 const struct xrt_pose *pose)
 {
 	os_mutex_lock(&ctdc->lock);
-	if (!ctdc->disconnected && ctdc->cb->cache_pnp_pose_candidate) {
+	if (!ctdc->disconnected && prior_epoch_matches_locked(ctdc, prior) && ctdc->cb->cache_pnp_pose_candidate) {
 		ctdc->cb->cache_pnp_pose_candidate(ctdc->xdev, frame_mono_ns, pose);
 	}
 	os_mutex_unlock(&ctdc->lock);
@@ -761,11 +796,13 @@ constellation_tracked_device_connection_cache_pnp_pose_candidate(struct t_conste
 static void
 constellation_tracked_device_connection_notify_world_reanchor(struct t_constellation_tracked_device_connection *ctdc,
                                                               timepoint_ns frame_mono_ns,
-                                                              const struct xrt_pose *delta)
+                                                              const struct xrt_pose *delta, const struct xrt_vec3 *new_raw_pivot,
+                                                              timepoint_ns publication_ns, double gyro_dps, double speed_mps)
 {
 	os_mutex_lock(&ctdc->lock);
 	if (!ctdc->disconnected && ctdc->cb->notify_world_reanchor) {
-		ctdc->cb->notify_world_reanchor(ctdc->xdev, frame_mono_ns, delta);
+		ctdc->cb->notify_world_reanchor(ctdc->xdev, frame_mono_ns, delta, new_raw_pivot,
+                                               publication_ns, gyro_dps, speed_mps);
 	}
 	os_mutex_unlock(&ctdc->lock);
 }
@@ -773,13 +810,14 @@ constellation_tracked_device_connection_notify_world_reanchor(struct t_constella
 static void
 constellation_tracked_device_connection_notify_leds(struct t_constellation_tracked_device_connection *ctdc,
                                                     timepoint_ns frame_mono_ns,
+                                                    const struct t_estimator_prior *prior,
                                                     const struct xrt_pose *P_xrworld_cam,
                                                     const struct t_constellation_cam_calib *cam_calib,
                                                     const struct t_constellation_led_obs *leds,
                                                     size_t led_count)
 {
 	os_mutex_lock(&ctdc->lock);
-	if (!ctdc->disconnected && ctdc->cb->push_observed_leds) {
+	if (!ctdc->disconnected && prior_epoch_matches_locked(ctdc, prior) && ctdc->cb->push_observed_leds) {
 		ctdc->cb->push_observed_leds(ctdc->xdev, frame_mono_ns, P_xrworld_cam, cam_calib, leds, led_count);
 	}
 	os_mutex_unlock(&ctdc->lock);
@@ -790,6 +828,7 @@ constellation_tracked_device_connection_notify_leds(struct t_constellation_track
 static bool
 constellation_tracked_device_connection_predict_led_gate(struct t_constellation_tracked_device_connection *ctdc,
                                                          timepoint_ns when_ns,
+                                                         const struct t_estimator_prior *prior,
                                                          const struct xrt_pose *P_xrworld_cam,
                                                          const struct t_constellation_cam_calib *cam_calib,
                                                          const struct xrt_vec3 *led_obj,
@@ -799,7 +838,10 @@ constellation_tracked_device_connection_predict_led_gate(struct t_constellation_
 	bool ret = false;
 
 	os_mutex_lock(&ctdc->lock);
-	if (!ctdc->disconnected && ctdc->cb->predict_led_gate) {
+	if (!ctdc->disconnected && prior != NULL) {
+		ret = ctdc->cb->predict_led_gate_from_prior &&
+		      ctdc->cb->predict_led_gate_from_prior(prior, P_xrworld_cam, cam_calib, led_obj, out_zhat, out_S);
+	} else if (!ctdc->disconnected && ctdc->cb->predict_led_gate) {
 		ret = ctdc->cb->predict_led_gate(ctdc->xdev, when_ns, P_xrworld_cam, cam_calib, led_obj,
 		                                  out_zhat, out_S);
 	}
@@ -1045,7 +1087,7 @@ emit_view_led_observations(struct tracking_sample_device_state *dev_state,
 	math_pose_transform(&view->P_cam_world, &P_YZ_FLIP, &P_xrworld_cam);
 	const struct t_constellation_cam_calib cam_calib = {cam->camera_model.calib.fx, cam->camera_model.calib.fy,
 	                                                    cam->camera_model.calib.cx, cam->camera_model.calib.cy};
-	constellation_tracked_device_connection_notify_leds(device->connection, sample_ts, &P_xrworld_cam,
+	constellation_tracked_device_connection_notify_leds(device->connection, sample_ts, dev_state->estimator_prior, &P_xrworld_cam,
 	                                                    &cam_calib, led_obs, (size_t)n_led_obs);
 	dev_state->led_emit_view_mask |= (1u << view_id);
 }
@@ -1061,6 +1103,7 @@ submit_device_pose(struct t_constellation_tracker *ct,
 	struct tracking_sample_frame *view = sample->views + view_id;
 	struct constellation_tracker_device *device = ct->devices + dev_state->dev_index;
 	struct pose_metrics *score = &dev_state->score;
+	if (!constellation_tracked_device_connection_prior_current(device->connection, dev_state->estimator_prior)) { return; }
 
 	mark_matching_blobs(ct, P_cam_obj, view->bwobs, &device->led_model, &dev_state->blob_match_info);
 
@@ -1135,7 +1178,7 @@ submit_device_pose(struct t_constellation_tracker *ct,
 			                                                                 average_brightness);
 		}
 
-		constellation_tracked_device_connection_notify_pose(device->connection, sample->timestamp,
+		constellation_tracked_device_connection_notify_pose(device->connection, sample->timestamp, dev_state->estimator_prior,
 		                                                    &P_xrworld_device);
 	}
 	os_mutex_unlock(&ct->tracked_device_lock);
@@ -1324,7 +1367,7 @@ association_fold_prior_leds(struct t_constellation_tracker *ct,
 
 			float zhat[2], S[4];
 			if (!constellation_tracked_device_connection_predict_led_gate(
-			        device->connection, sample->timestamp, &P_xrworld_cam, &cam_calib, &led_obj,
+			        device->connection, sample->timestamp, dev_state->estimator_prior, &P_xrworld_cam, &cam_calib, &led_obj,
 			        zhat, S)) {
 				/* Untracked or non-finite for this LED. Keep testing the remaining LEDs: edge-FOV
 				 * sparse frames often have only a few useful LEDs, and one bad projection must not
@@ -4443,7 +4486,7 @@ association_cache_hypothesis_pnp_pose(struct t_constellation_tracker *ct,
 
 	struct xrt_pose P_xrworld_device;
 	math_pose_transform(&P_xrworld_model, &device->led_model.P_model_device, &P_xrworld_device);
-	constellation_tracked_device_connection_cache_pnp_pose_candidate(device->connection, sample->timestamp,
+	constellation_tracked_device_connection_cache_pnp_pose_candidate(device->connection, sample->timestamp, dev_state->estimator_prior,
 	                                                                &P_xrworld_device);
 }
 
@@ -4486,7 +4529,7 @@ association_fold_triangulated_position(struct t_constellation_tracker *ct,
 
 	const float std_m = res->position_std_m;
 	const struct xrt_vec3 position_variance = {std_m * std_m, std_m * std_m, std_m * std_m};
-	constellation_tracked_device_connection_notify_position(device->connection, sample->timestamp,
+	constellation_tracked_device_connection_notify_position(device->connection, sample->timestamp, dev_state->estimator_prior,
 	                                                        &P_xrworld_device.position,
 	                                                        &position_variance, true);
 }
@@ -4790,7 +4833,7 @@ association_commit_position_only(struct t_constellation_tracker *ct,
 	const struct xrt_vec3 position_variance = {std_m * std_m, std_m * std_m, std_m * std_m};
 	const bool refresh_optical_anchor =
 	    association_position_only_refreshes_optical_anchor(hyp, used_pnp_position);
-	constellation_tracked_device_connection_notify_position(device->connection, sample->timestamp,
+	constellation_tracked_device_connection_notify_position(device->connection, sample->timestamp, dev_state->estimator_prior,
 	                                                        &position, &position_variance,
 	                                                        refresh_optical_anchor);
 
@@ -5209,6 +5252,15 @@ mask_union_device_rect(const struct tracking_sample_frame *view,
 	return true;
 }
 
+/* Reuse the matcher's optical geometry horizon. Updating a rectangle every camera frame does
+ * not make an old optical observation current, and a future timestamp is not valid evidence. */
+static bool
+controller_mask_observation_fresh(uint64_t frame_ts, bool have_last_seen_pose, uint64_t last_seen_pose_ts)
+{
+	return have_last_seen_pose && frame_ts >= last_seen_pose_ts &&
+	       frame_ts - last_seen_pose_ts <= (uint64_t)(ROI_MAX_OPTICAL_AGE_MS * U_TIME_1MS_IN_NS);
+}
+
 /* B5 mask repair: push the SLAM controller masks for this frame, one rect per connected device
  * per camera, from the live prediction + last-seen pose (see the MASK_* constants' comment for
  * the measured rationale). Runs at frame cadence under the tracked-device lock, so mask staleness
@@ -5239,6 +5291,9 @@ push_controller_masks(struct t_constellation_tracker *ct, struct constellation_t
 			struct xrt_device_masks_sample_device *device_mask =
 			    &sample_camera->devices[dev_state->dev_index];
 
+			const struct constellation_tracker_device *device = ct->devices + dev_state->dev_index;
+			const bool optical_fresh = controller_mask_observation_fresh(
+			    sample->timestamp, dev_state->have_last_seen_pose, device->last_seen_pose_ts);
 			bool have_rect = false;
 			struct pose_rect rect = {0, 0, 0, 0};
 			sigma_px[i][d] = -1.0f;
@@ -5247,7 +5302,8 @@ push_controller_masks(struct t_constellation_tracker *ct, struct constellation_t
 			 * exactly as far as the fusion can bound it: a coasting controller gets a
 			 * honestly-larger rect, a lost/divergent one inflates past the area cap below
 			 * and self-disables. */
-			if (dev_state->prior_pos_std_m >= 0.0f) {
+			if (dev_state->prior_pos_std_m >= 0.0f &&
+			    (dev_state->prior_position_tracked || optical_fresh)) {
 				float depth_m = MASK_SIGMA_MIN_DEPTH_M;
 				if (mask_union_device_rect(view, cam, dev_state->led_model,
 				                           &dev_state->P_world_obj_prior, have_rect, &rect,
@@ -5265,10 +5321,10 @@ push_controller_masks(struct t_constellation_tracker *ct, struct constellation_t
 				}
 			}
 
-			/* Last-seen rect: world-anchored optical truth, re-projected through the live
-			 * head pose — a lost-but-resting controller keeps emitting light there (the
-			 * static-map exemption pattern). */
-			if (dev_state->have_last_seen_pose &&
+			/* Fresh observed geometry remains useful during a short coast or confirmed idle,
+			 * even when the estimator reports position untracked. An expired observation must
+			 * not keep excluding scene features indefinitely. */
+			if (optical_fresh &&
 			    mask_union_device_rect(view, cam, dev_state->led_model, &dev_state->last_seen_pose,
 			                           have_rect, &rect, NULL)) {
 				have_rect = true;
@@ -5341,6 +5397,37 @@ push_controller_masks(struct t_constellation_tracker *ct, struct constellation_t
 	xrt_sink_push_device_masks(ct->controller_masks_sink, masks);
 }
 
+/* The device estimator uses OpenXR world coordinates; frontend optical caches use the
+ * sandwich-flipped OpenCV world. Rebase both in the same transaction before this frame
+ * takes its priors/camera geometry. Preserve observation timestamps: a rebase is not a
+ * new optical observation. Caller holds no tracked-device or connection lock. */
+static void
+constellation_reanchor_devices(struct t_constellation_tracker *ct,
+                                timepoint_ns frame_mono_ns,
+                                const struct xrt_pose *delta,
+                                const struct xrt_vec3 *new_raw_pivot,
+                                timepoint_ns publication_ns,
+                                double gyro_dps,
+                                double speed_mps)
+{
+	struct xrt_pose delta_cv;
+	pose_flip_YZ(delta, &delta_cv);
+	os_mutex_lock(&ct->tracked_device_lock);
+	for (int i = 0; i < ct->num_devices; i++) {
+		struct constellation_tracker_device *device = ct->devices + i;
+		if (device->have_last_seen_pose) {
+			struct xrt_pose rebased;
+			math_pose_transform(&delta_cv, &device->last_seen_pose, &rebased);
+			device->last_seen_pose = rebased;
+		}
+		if (device->connection != NULL) {
+			constellation_tracked_device_connection_notify_world_reanchor(
+			    device->connection, frame_mono_ns, delta, new_raw_pivot, publication_ns, gyro_dps, speed_mps);
+		}
+	}
+	os_mutex_unlock(&ct->tracked_device_lock);
+}
+
 // Fast frame processing: blob extraction and match to existing predictions
 static void
 constellation_tracker_process_frame_fast(struct xrt_frame_sink *sink, struct xrt_frame *xf)
@@ -5399,14 +5486,16 @@ constellation_tracker_process_frame_fast(struct xrt_frame_sink *sink, struct xrt
 				         "device fusion world state",
 				         xf->timestamp, st.dang_deg, st.dnorm_m * 1e3, st.exc_ang_deg,
 				         st.exc_pos_m * 1e3);
-				for (int i = 0; i < ct->num_devices; i++) {
-					struct t_constellation_tracked_device_connection *conn =
-					    ct->devices[i].connection;
-					if (conn != NULL) {
-						constellation_tracked_device_connection_notify_world_reanchor(
-						    conn, (timepoint_ns)xf->timestamp, &delta);
-					}
-				}
+				// One publication clock and pivot for this exact raw transition on both hands.
+				const timepoint_ns publication_ns = os_monotonic_get_ns();
+				struct xrt_pose new_pivot_pose = { .orientation = {0, 0, 0, 1},
+				                                  .position = ct->reanchor_prev_pose.position };
+				struct xrt_pose transformed_pivot;
+				math_pose_transform(&delta, &new_pivot_pose, &transformed_pivot);
+				const struct xrt_vec3 *lv = &xsr_base_pose.linear_velocity;
+				const double speed_mps = sqrt((double)lv->x*lv->x + (double)lv->y*lv->y + (double)lv->z*lv->z);
+				constellation_reanchor_devices(ct, (timepoint_ns)xf->timestamp, &delta,
+				                               &transformed_pivot.position, publication_ns, gyro_dps, speed_mps);
 			}
 		}
 		ct->reanchor_prev_pose = xsr_base_pose.pose;
@@ -5419,6 +5508,15 @@ constellation_tracker_process_frame_fast(struct xrt_frame_sink *sink, struct xrt
 	assert(ct->cam_count <= XRT_TRACKING_MAX_SLAM_CAMS);
 	sample->n_views = ct->cam_count;
 	sample->timestamp = xf->timestamp;
+	/* One prior per device BEFORE any ROI, blob association, or view fold. The frame consumer is
+	 * serial and waits for cold workers before finishing; camera geometry and these tokens stay paired. */
+	os_mutex_lock(&ct->tracked_device_lock);
+	assert(ct->num_devices <= CONSTELLATION_MAX_DEVICES);
+	for (int d = 0; d < ct->num_devices; ++d) {
+		sample->estimator_prior_supported[d] = constellation_tracked_device_connection_get_estimator_prior(
+		    ct->devices[d].connection, xf->timestamp, &sample->estimator_priors[d]);
+	}
+	os_mutex_unlock(&ct->tracked_device_lock);
 
 	for (int i = 0; i < ct->cam_count; i++) {
 		struct constellation_tracker_camera_state *cam = ct->cam + i;
@@ -5490,9 +5588,14 @@ constellation_tracker_process_frame_fast(struct xrt_frame_sink *sink, struct xrt
 						}
 						n_connected_devices++;
 						double optical_age_ms = 0.0;
-						if (constellation_tracked_device_connection_get_last_optical_age_ms(
-						        device->connection, xf->timestamp, &optical_age_ms) &&
-						    optical_age_ms > ROI_MAX_OPTICAL_AGE_MS) {
+						if (sample->estimator_prior_supported[d]) {
+							optical_age_ms = sample->estimator_priors[d].optical_age_ms;
+							if (!sample->estimator_priors[d].valid) { continue; }
+						} else {
+							constellation_tracked_device_connection_get_last_optical_age_ms(
+							    device->connection, xf->timestamp, &optical_age_ms);
+						}
+						if (optical_age_ms > ROI_MAX_OPTICAL_AGE_MS) {
 							continue;
 						}
 						int device_in_frame = 0;
@@ -5503,7 +5606,8 @@ constellation_tracker_process_frame_fast(struct xrt_frame_sink *sink, struct xrt
 					math_pose_transform_point(&lm->P_device_model, &led_flip, &led_obj);
 					float zhat[2], S[4];
 						if (!constellation_tracked_device_connection_predict_led_gate(
-						        device->connection, xf->timestamp, &P_xrworld_cam_pred,
+						        device->connection, xf->timestamp,
+						        sample->estimator_prior_supported[d] ? &sample->estimator_priors[d] : NULL, &P_xrworld_cam_pred,
 						        &cam_calib_pred, &led_obj, zhat, S)) {
 							continue; /* device untracked: no usable prior */
 						}
@@ -5597,12 +5701,20 @@ constellation_tracker_process_frame_fast(struct xrt_frame_sink *sink, struct xrt
 		}
 
 		struct tracking_sample_device_state *dev_state = sample->devices + sample->n_devices;
+		const struct t_estimator_prior *prior = sample->estimator_prior_supported[d] ?
+		    &sample->estimator_priors[d] : NULL;
+		dev_state->estimator_prior = prior;
+		if (!constellation_tracked_device_connection_prior_current(device->connection, prior)) {
+			continue; // old camera geometry cannot be associated or cached in a new raw world
+		}
 
 		// Prior pose for matching: the fusion's RAW estimate (no body-lock ride — the visual out-of-view
 		// ride must never feed back as the matcher's prior), falling back to the device's reported pose for
 		// a device that doesn't expose the raw estimate.
 		struct xrt_space_relation xsr;
-		if (!constellation_tracked_device_connection_get_predicted_pose(device->connection, xf->timestamp,
+		if (prior) {
+			xsr = prior->relation; // invalid history remains a connected cold-search device
+		} else if (!constellation_tracked_device_connection_get_predicted_pose(device->connection, xf->timestamp,
 		                                                                &xsr) &&
 		    !constellation_tracked_device_connection_get_tracked_pose(device->connection, xf->timestamp,
 		                                                              &xsr)) {
@@ -5638,8 +5750,16 @@ constellation_tracker_process_frame_fast(struct xrt_frame_sink *sink, struct xrt
 		float yaw_sigma = (float)FLIP_COST_YAW_SIGMA_MAX;
 		float tilt_sigma = (float)GRAVITY_TILT_TOL;
 		dev_state->prior_pos_std_m = -1.0f;
-		if (constellation_tracked_device_connection_get_pose_uncertainty(device->connection, &pos_std,
-		                                                                 &rot_std, &yaw_std, &tilt_std)) {
+		bool have_uncertainty;
+		if (prior) {
+			have_uncertainty = prior->valid;
+			pos_std = prior->position_std_m; rot_std = prior->orientation_std_rad;
+			yaw_std = prior->yaw_std_rad; tilt_std = prior->tilt_std_rad;
+		} else {
+			have_uncertainty = constellation_tracked_device_connection_get_pose_uncertainty(
+			    device->connection, &pos_std, &rot_std, &yaw_std, &tilt_std);
+		}
+		if (have_uncertainty) {
 			pos_bound = (float)fmin(fmax(PRIOR_GATE_SIGMA * pos_std, MIN_POS_ERROR), MAX_POS_ERROR);
 			rot_bound = (float)fmin(fmax(PRIOR_GATE_SIGMA * rot_std, MIN_ROT_ERROR), MAX_ROT_ERROR);
 			yaw_sigma = (float)fmin(fmax(yaw_std, FLIP_COST_YAW_SIGMA_MIN), FLIP_COST_YAW_SIGMA_MAX);
@@ -5648,7 +5768,7 @@ constellation_tracker_process_frame_fast(struct xrt_frame_sink *sink, struct xrt
 			/* TILT is driftless (gravity-anchored): trusted whenever the fusion is tracking, even through a
 			 * dropout. The soft cost's yaw scale (yaw_sigma) widens with the live yaw uncertainty, so a
 			 * stale yaw self-deweights rather than needing a binary trust flag. */
-			tilt_trusted = true; /* get_pose_uncertainty returned true => tracking => gravity-anchored prior */
+			tilt_trusted = prior ? prior->gravity_valid : true;
 		}
 			dev_state->prior_tilt_trusted = tilt_trusted;
 			dev_state->prior_position_tracked =
@@ -5656,10 +5776,13 @@ constellation_tracker_process_frame_fast(struct xrt_frame_sink *sink, struct xrt
 			dev_state->prior_orientation_tracked =
 			    (xsr.relation_flags & XRT_SPACE_RELATION_ORIENTATION_TRACKED_BIT) != 0;
 			double last_optical_age_ms = 0.0;
-		dev_state->prior_optical_stale =
-		    constellation_tracked_device_connection_get_last_optical_age_ms(device->connection, xf->timestamp,
-		                                                                   &last_optical_age_ms) &&
-		    last_optical_age_ms > ASSOC_STALE_PRIOR_RECOVERY_AGE_MS;
+		if (prior) {
+			last_optical_age_ms = prior->optical_age_ms;
+		} else {
+			constellation_tracked_device_connection_get_last_optical_age_ms(
+			    device->connection, xf->timestamp, &last_optical_age_ms);
+		}
+		dev_state->prior_optical_stale = last_optical_age_ms > ASSOC_STALE_PRIOR_RECOVERY_AGE_MS;
 		dev_state->prior_yaw_sigma_rad = yaw_sigma;
 		dev_state->prior_tilt_sigma_rad = tilt_sigma;
 		dev_state->prior_pos_error.x = dev_state->prior_pos_error.y = dev_state->prior_pos_error.z =
@@ -5672,8 +5795,15 @@ constellation_tracker_process_frame_fast(struct xrt_frame_sink *sink, struct xrt
 		dev_state->P_world_obj_gravity = dev_state->P_world_obj_prior;
 		struct xrt_quat gravity_q = {0.0f, 0.0f, 0.0f, 1.0f};
 		double gravity_excess = 1e9;
-		if (constellation_tracked_device_connection_get_gravity_tilt_reference(device->connection, &gravity_q,
-		                                                                       &gravity_excess)) {
+		bool have_gravity;
+		if (prior) {
+			have_gravity = prior->valid && prior->gravity_valid;
+			gravity_q = prior->gravity_orientation; gravity_excess = prior->gravity_excess_m_s2;
+		} else {
+			have_gravity = constellation_tracked_device_connection_get_gravity_tilt_reference(
+			    device->connection, &gravity_q, &gravity_excess);
+		}
+		if (have_gravity) {
 			struct xrt_pose P_xrworld_gravity = P_xrworld_model;
 			P_xrworld_gravity.orientation = gravity_q;
 			pose_flip_YZ(&P_xrworld_gravity, &dev_state->P_world_obj_gravity);

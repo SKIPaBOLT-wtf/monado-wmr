@@ -77,7 +77,8 @@ wmr_controller_telem_id(struct wmr_controller_base *wcb)
 void
 wmr_controller_base_imu_sample(struct wmr_controller_base *wcb,
                                struct wmr_controller_base_imu_sample *imu_sample,
-                               timepoint_ns rx_mono_ns)
+                               timepoint_ns rx_mono_ns,
+                               bool imu_valid)
 {
 	/* Extend 32-bit tick count to 64-bit and convert to ns */
 	uint32_t tick_delta = imu_sample->timestamp_ticks - (uint32_t)wcb->last_timestamp_ticks;
@@ -93,6 +94,13 @@ wmr_controller_base_imu_sample(struct wmr_controller_base *wcb,
 		WMR_DEBUG(wcb,
 		          "Dropping IMU sample until clock estimator synchronises. Rcv ts %" PRIu64 " hw ts %" PRIu64,
 		          rx_mono_ns, now_hw_ns);
+		return;
+	}
+
+	// Preserve the distinction between a hardware sleep status and a real sensor sample.
+	// The fusion can hold a recently confirmed rest state without inventing an IMU measurement.
+	if (!imu_valid) {
+		kalman_fusion_process_idle_status(wcb->kalman_fusion, mono_time_ns);
 		return;
 	}
 
@@ -260,7 +268,12 @@ wmr_controller_send_fw_cmd(struct wmr_controller_base *wcb,
 	}
 
 	do {
-		int size = wmr_controller_read_sync(wcb, response->buf, sizeof(response->buf), timeout_ms);
+		int64_t remaining_ns = timeout_end_ns - os_monotonic_get_ns();
+		if (remaining_ns <= 0) {
+			break;
+		}
+		int remaining_ms = (int)((remaining_ns + U_TIME_1MS_IN_NS - 1) / U_TIME_1MS_IN_NS);
+		int size = wmr_controller_read_sync(wcb, response->buf, sizeof(response->buf), remaining_ms);
 		if (size == -1) {
 			return -1;
 		}
@@ -791,10 +804,12 @@ wmr_controller_query_hmd_pose(struct wmr_controller_base *wcb, int64_t at_timest
 }
 
 static xrt_result_t
-wmr_controller_base_get_tracked_pose(struct xrt_device *xdev,
+wmr_controller_base_get_pose_pair(struct xrt_device *xdev,
                                      enum xrt_input_name name,
                                      int64_t at_timestamp_ns,
-                                     struct xrt_space_relation *out_relation)
+                                     struct xrt_space_relation *out_relation,
+                                     struct xrt_pose *out_from_raw, uint64_t *out_generation,
+                                     const struct xrt_pose *presented_hmd_in_tracking)
 {
 	DRV_TRACE_MARKER();
 
@@ -813,14 +828,38 @@ wmr_controller_base_get_tracked_pose(struct xrt_device *xdev,
 	// HMD pose so an out-of-view controller body-locks (rides with the head at arm's reach) instead of
 	// dead-reckoning to metres in world frame.
 	struct xrt_pose hmd_pose;
-	const struct xrt_pose *hmd_world_pose = wmr_controller_query_hmd_pose(wcb, at_timestamp_ns, &hmd_pose);
-	kalman_fusion_get_prediction(wcb->kalman_fusion, at_timestamp_ns, &relation, hmd_world_pose);
+	if (out_from_raw != NULL) {
+		// OpenVR's paired head pose is middle-eye. Body/reach logic historically uses the IMU
+		// reference: remove only its fixed local extrinsic, without another raw head query.
+		const struct xrt_pose *presented_imu = presented_hmd_in_tracking;
+		if (presented_hmd_in_tracking != NULL && wcb->hmd_xdev != NULL) {
+			struct wmr_hmd *hmd = wmr_hmd(wcb->hmd_xdev);
+			if (hmd->tracking.slam_enabled && hmd->slam_over_3dof && hmd->tracking.imu2me) {
+				struct xrt_pose me_to_imu;
+				math_pose_invert(&hmd->config.sensors.transforms.P_imu_me, &me_to_imu);
+				math_pose_transform(presented_hmd_in_tracking, &me_to_imu, &hmd_pose);
+				presented_imu = &hmd_pose;
+			}
+		}
+		kalman_fusion_get_prediction_with_presentation(wcb->kalman_fusion, at_timestamp_ns, &relation,
+		                                              presented_imu, out_from_raw, out_generation);
+	} else {
+		const struct xrt_pose *hmd_world_pose = wmr_controller_query_hmd_pose(wcb, at_timestamp_ns, &hmd_pose);
+		kalman_fusion_get_prediction(wcb->kalman_fusion, at_timestamp_ns, &relation, hmd_world_pose);
+	}
 
 	m_relation_chain_push_relation(&xrc, &relation);
 	m_relation_chain_resolve(&xrc, out_relation);
 
 	wcb->pose = out_relation->pose;
 	return XRT_SUCCESS;
+}
+
+static xrt_result_t
+wmr_controller_base_get_tracked_pose(struct xrt_device *xdev, enum xrt_input_name name,
+                                    int64_t at_timestamp_ns, struct xrt_space_relation *out_relation)
+{
+    return wmr_controller_base_get_pose_pair(xdev, name, at_timestamp_ns, out_relation, NULL, NULL, NULL);
 }
 
 void
@@ -901,6 +940,7 @@ wmr_controller_base_init(struct wmr_controller_base *wcb,
 
 	// Set all functions.
 	u_device_populate_function_pointers(&wcb->base, wmr_controller_base_get_tracked_pose, destroy_fn);
+	wcb->base.get_tracked_pose_with_presentation = wmr_controller_base_get_pose_pair;
 
 	wcb->base.name = XRT_DEVICE_WMR_CONTROLLER;
 	wcb->base.device_type = controller_type;
@@ -1353,6 +1393,37 @@ wmr_controller_base_get_led_model(struct xrt_device *xdev, struct t_constellatio
 }
 
 static bool
+wmr_controller_base_get_estimator_prior(struct xrt_device *xdev, timepoint_ns when_ns,
+                                      struct t_estimator_prior *out)
+{
+	struct wmr_controller_base *wcb = (struct wmr_controller_base *)xdev;
+	if (!wcb->kalman_fusion) { return false; }
+	kalman_fusion_get_estimator_prior(wcb->kalman_fusion, when_ns + wcb->ctrl_optical_td_ns, out);
+	return true; // supported even without usable history: cold optical bootstrap remains possible
+}
+
+static bool
+wmr_controller_base_validate_prior_epoch(struct xrt_device *xdev, const struct t_estimator_prior *prior)
+{
+	struct wmr_controller_base *wcb = (struct wmr_controller_base *)xdev;
+	return wcb->kalman_fusion && prior &&
+	       kalman_fusion_get_world_generation(wcb->kalman_fusion) == prior->world_generation;
+}
+
+static bool
+wmr_controller_base_predict_led_gate_from_prior(const struct t_estimator_prior *prior,
+    const struct xrt_pose *P_xrworld_cam, const struct t_constellation_cam_calib *calib,
+    const struct xrt_vec3 *led_obj, float out_zhat[2], float out_S[4])
+{
+	struct kalman_led_camera_view view = {
+	    .fx = calib->fx, .fy = calib->fy, .cx = calib->cx, .cy = calib->cy,
+	    .cam_world_orient = P_xrworld_cam->orientation, .cam_world_pos = P_xrworld_cam->position,
+	};
+	struct kalman_led_observation obs = {.led_obj = *led_obj};
+	return kalman_fusion_predict_led_gate_from_prior(prior, &obs, &view, out_zhat, out_S);
+}
+
+static bool
 wmr_controller_base_get_pose_uncertainty(struct xrt_device *xdev,
                                          double *position_std,
                                          double *orientation_std,
@@ -1390,7 +1461,7 @@ wmr_controller_base_get_predicted_pose(struct xrt_device *xdev,
 	if (wcb->kalman_fusion == NULL) {
 		return false;
 	}
-	// The matcher's PRIOR uses the raw estimate (no body-lock ride), wait-free from the published snapshot.
+	// Compatibility entry point; the production matcher acquires the complete historical bundle once.
 	kalman_fusion_get_predicted_pose(wcb->kalman_fusion, when_ns + wcb->ctrl_optical_td_ns, out_relation);
 	return true;
 }
@@ -1693,7 +1764,8 @@ wmr_controller_base_cache_pnp_pose_candidate(struct xrt_device *xdev,
 static void
 wmr_controller_base_notify_world_reanchor(struct xrt_device *xdev,
                                           timepoint_ns frame_mono_ns,
-                                          const struct xrt_pose *delta)
+                                          const struct xrt_pose *delta, const struct xrt_vec3 *new_raw_pivot,
+                                          timepoint_ns publication_ns, double gyro_dps, double speed_mps)
 {
 	struct wmr_controller_base *wcb = (struct wmr_controller_base *)(xdev);
 	if (wcb->kalman_fusion == NULL || delta == NULL) {
@@ -1701,11 +1773,15 @@ wmr_controller_base_notify_world_reanchor(struct xrt_device *xdev,
 	}
 	(void)frame_mono_ns;
 	os_mutex_lock(&wcb->data_lock);
-	kalman_fusion_re_anchor_world(wcb->kalman_fusion, delta);
+	kalman_fusion_re_anchor_world_with_presentation(wcb->kalman_fusion, delta, new_raw_pivot,
+	                                                publication_ns, gyro_dps, speed_mps);
 	os_mutex_unlock(&wcb->data_lock);
 }
 
 static struct t_constellation_tracked_device_callbacks tracking_callbacks = {
+    .get_estimator_prior = wmr_controller_base_get_estimator_prior,
+    .validate_prior_epoch = wmr_controller_base_validate_prior_epoch,
+    .predict_led_gate_from_prior = wmr_controller_base_predict_led_gate_from_prior,
     .get_led_model = wmr_controller_base_get_led_model,
     .notify_frame_received = wmr_controller_base_notify_frame,
     .push_observed_pose = wmr_controller_base_push_observed_pose,

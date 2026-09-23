@@ -6125,3 +6125,75 @@ TEST_CASE("kalman: render-time extrapolation does not over-damp a genuine accele
 	CHECK(lead > vel_only + 0.6 * (ballistic - vel_only)); // kept >= 60% of the genuine accel term
 	CHECK(lead == Approx(ballistic).margin(0.003));        // within 3 mm of the full ballistic extrapolation
 }
+
+TEST_CASE("kalman: rejected PnP position cannot adopt its gyro reference")
+{
+	const bool lagged = GENERATE(false, true);
+	auto control = KalmanFusionInterface::create();
+	auto tested = KalmanFusionInterface::create();
+	const xrt_vec3 home{0.4f, 1.1f, -0.7f};
+	const xrt_vec3 rest = make_accel_body(IDENTITY_QUAT, ZERO_VEC);
+	int64_t ts = 1000000000;
+	for (int i = 0; i <= 200; i++) {
+		ts = 1000000000 + i * 5000000;
+		for (auto *kf : {control.get(), tested.get()}) {
+			feed_pose(kf, ts, home, IDENTITY_QUAT);
+			feed_imu(kf, ts, rest, ZERO_VEC);
+		}
+	}
+	const int64_t rejected_ns = ts + 95000000;
+	const int64_t accepted_ns = ts + 100000000;
+	const int64_t now = accepted_ns + (lagged ? 60000000 : 0);
+	for (int64_t t = ts + 5000000; t <= now; t += 5000000) {
+		for (auto *kf : {control.get(), tested.get()}) feed_imu(kf, t, rest, ZERO_VEC);
+	}
+	const xrt_vec3 impossible{100.0f, 100.0f, 100.0f};
+	feed_pose(control.get(), rejected_ns, impossible, IDENTITY_QUAT);
+	feed_pose(tested.get(), rejected_ns, impossible, quat_axis_angle({0, 1, 0}, 80.0f * M_PI / 180.0f));
+	xrt_space_relation before_a{}, before_b{};
+	control->get_predicted_pose(now, &before_a);
+	tested->get_predicted_pose(now, &before_b);
+	CHECK(quat_abs_dot(before_a.pose.orientation, before_b.pose.orientation) > 0.999999f);
+	const xrt_vec3 shifted{home.x + 0.6f, home.y, home.z};
+	const xrt_quat distant = quat_axis_angle({0, 1, 0}, 160.0f * M_PI / 180.0f);
+	for (auto *kf : {control.get(), tested.get()}) feed_pose(kf, accepted_ns, shifted, distant);
+	xrt_space_relation a{}, b{};
+	control->get_predicted_pose(now, &a);
+	tested->get_predicted_pose(now, &b);
+	CHECK(quat_abs_dot(a.pose.orientation, b.pose.orientation) > 0.999999f);
+	CHECK(quat_abs_dot(b.pose.orientation, IDENTITY_QUAT) > 0.999f);
+}
+
+TEST_CASE("kalman: failed LED recovery preserves accepted state and uncertainty")
+{
+	auto kf = KalmanFusionInterface::create();
+	const xrt_vec3 home{0.4f, 1.1f, 0.7f};
+	const xrt_vec3 rest = make_accel_body(IDENTITY_QUAT, ZERO_VEC);
+	int64_t ts = 1000000000;
+	for (int i = 0; i <= 200; i++) {
+		ts = 1000000000 + i * 5000000;
+		feed_pose(kf.get(), ts, home, IDENTITY_QUAT);
+		feed_imu(kf.get(), ts, rest, ZERO_VEC);
+	}
+	xrt_space_relation before{}, after{};
+	kf->get_predicted_pose(ts, &before);
+	double p0, q0, p1, q1;
+	REQUIRE(kf->get_pose_uncertainty(&p0, &q0, nullptr, nullptr));
+	LEDCameraView view{};
+	view.fx = view.fy = 300;
+	view.cam_world_orient = IDENTITY_QUAT;
+	std::vector<LEDObservation> obs;
+	for (int i = 0; i < 8; i++) {
+		LEDObservation o{};
+		o.led_obj = {0.01f * i, 0.0f, 0.0f};
+		o.observed_px = {1000000.0f, 1000000.0f};
+		obs.push_back(o);
+	}
+	CHECK(kf->process_led_observations(ts, obs, view, nullptr, 15.0f, true, nullptr) == 0.0f);
+	kf->get_predicted_pose(ts, &after);
+	REQUIRE(kf->get_pose_uncertainty(&p1, &q1, nullptr, nullptr));
+	CHECK(norm(after.pose.position - before.pose.position) < 1e-7f);
+	CHECK(quat_abs_dot(after.pose.orientation, before.pose.orientation) > 0.999999f);
+	CHECK(p1 == Approx(p0).epsilon(1e-12));
+	CHECK(q1 == Approx(q0).epsilon(1e-12));
+}

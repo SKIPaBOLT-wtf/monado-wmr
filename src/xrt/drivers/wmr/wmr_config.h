@@ -170,6 +170,14 @@ struct wmr_hmd_config
 bool
 wmr_hmd_config_parse(struct wmr_hmd_config *c, char *json_string, enum u_logging_level log_level);
 
+struct cJSON;
+
+//! Optional exact-factory HT1 Rt replacement. Failure leaves the factory tree unchanged.
+bool
+wmr_hmd_config_apply_ht1_override(struct cJSON *factory_info,
+                                  const struct cJSON *override,
+                                  enum u_logging_level log_level);
+
 
 struct wmr_controller_config
 {

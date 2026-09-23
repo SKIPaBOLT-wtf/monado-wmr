@@ -14,6 +14,7 @@
 #include <cstring>
 #include <cstdlib>
 #include <cassert>
+#include <algorithm>
 #include <array>
 #include <mutex>
 #include <thread>
@@ -195,13 +196,13 @@ copy_quat(const struct xrt_quat *from, vr::HmdQuaternion_t *to)
 }
 
 /*
- * World re-anchor glide (the B2 head resnap guard). ONE correction delta owned by the driver
- * provider and shared by all three devices, applied at this — the single uniform tracking->
+ * World re-anchor glide (the B2 head resnap guard). A head correction delta owned by the driver
+ * provider, also used by legacy devices without paired pose metadata, applied at the tracking->
  * presentation seam, AFTER every internal consumer (constellation vision, ESKF, telemetry taps)
  * has been served the raw pose. The HMD pull drives detection + decay (it has the freshest
- * relation and its IMU-derived velocities for the envelope); controller pulls apply the current
- * delta without re-decaying, so the result is device-order independent and hand/world/head stay
- * coherent through a glide. Design + offline validation: results/b2-resnap-design-20260704/.
+ * relation and its IMU-derived velocities for the envelope). WMR controller pulls instead use
+ * the exact correction paired with their own raw reanchor snapshot; their raw event arrives on
+ * the camera thread and must never be combined with this independently sampled head delta. Design + offline validation: results/b2-resnap-design-20260704/.
  */
 namespace {
 struct WorldReanchorGuard
@@ -247,8 +248,13 @@ world_guard_pack_delta(const struct u_world_reanchor &wr, float out_delta7[7])
 static void
 apply_pose(const struct xrt_space_relation *rel, const struct xrt_pose *presented, vr::DriverPose_t *m_pose)
 {
-	if ((rel->relation_flags & XRT_SPACE_RELATION_ORIENTATION_TRACKED_BIT) != 0) {
+	if ((rel->relation_flags & XRT_SPACE_RELATION_ORIENTATION_VALID_BIT) != 0) {
 		copy_quat(&presented->orientation, &m_pose->qRotation);
+		// A confirmed stationary hold remains a valid pose after optical tracking ages out.
+		// Preserve its visibility while reporting the lack of fresh tracking honestly.
+		if ((rel->relation_flags & XRT_SPACE_RELATION_ORIENTATION_TRACKED_BIT) == 0) {
+			m_pose->result = vr::TrackingResult_Running_OutOfRange;
+		}
 	} else {
 		m_pose->result = vr::TrackingResult_Running_OutOfRange;
 		m_pose->poseIsValid = false;
@@ -550,6 +556,9 @@ public:
 			if (hand == XRT_HAND_RIGHT) {
 				m_render_model = "oculus_cv1_controller_right";
 			}
+			break;
+		case XRT_DEVICE_HP_REVERB_G2_CONTROLLER:
+			m_render_model = hand == XRT_HAND_LEFT ? "{monado}hp_reverb_g2_left" : "{monado}hp_reverb_g2_right";
 			break;
 		case XRT_DEVICE_VIVE_WAND: m_render_model = "vr_controller_vive_1_5"; break;
 		case XRT_DEVICE_VIVE_TRACKER_GEN1:
@@ -1166,20 +1175,64 @@ public:
 		timepoint_ns now_ns = os_monotonic_get_ns();
 
 		struct xrt_space_relation rel;
-		xrt_device_get_tracked_pose(m_xdev, grip_name, now_ns, &rel);
+		struct xrt_pose from_raw = {{0.f, 0.f, 0.f, 1.f}, {0.f, 0.f, 0.f}};
+		uint64_t world_generation = 0;
+		const bool paired_world = m_xdev->get_tracked_pose_with_presentation != nullptr;
+		if (paired_world) {
+			// Reporting-only body/reach logic needs the head in the same presentation frame.
+			// Read the head's already-paired pose+guard, then convert to this tracking origin.
+			struct xrt_pose presented_head, head_in_tracking;
+			bool have_head = false;
+			{
+				std::lock_guard<std::mutex> lk(g_world_guard.lock);
+				have_head = g_world_guard.have_prev;
+				if (have_head) u_world_reanchor_apply(&g_world_guard.wr, &g_world_guard.prev_pose, &presented_head);
+			}
+			if (have_head) {
+				struct xrt_pose inv_origin;
+				math_pose_invert(&m_xdev->tracking_origin->initial_offset, &inv_origin);
+				math_pose_transform(&inv_origin, &presented_head, &head_in_tracking);
+			}
+			m_xdev->get_tracked_pose_with_presentation(m_xdev, grip_name, now_ns, &rel,
+			                                                &from_raw, &world_generation,
+			                                                have_head ? &head_in_tracking : nullptr);
+		} else {
+			xrt_device_get_tracked_pose(m_xdev, grip_name, now_ns, &rel);
+		}
 
 		struct xrt_pose *offset = &m_xdev->tracking_origin->initial_offset;
 
 		struct xrt_relation_chain chain = {};
 		m_relation_chain_push_relation(&chain, &rel);
 		m_relation_chain_push_pose_if_not_identity(&chain, offset);
-		m_relation_chain_resolve(&chain, &rel);
+		struct xrt_space_relation raw_in_origin;
+		m_relation_chain_resolve(&chain, &raw_in_origin);
 
-		// Apply the CURRENT world re-anchor delta (no detection/decay here — the HMD pull owns
-		// that), so hands glide coherently with the world through a head re-anchor.
-		struct xrt_pose presented = rel.pose;
+		struct xrt_pose presented;
 		float delta7[7] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 1.f};
-		{
+		if (paired_world) {
+			// Apply the correction paired with this exact raw snapshot, before the origin transform.
+			// The relation chain rotates world velocities too; no glide derivative enters IMU rates.
+			struct xrt_relation_chain presentation_chain = {};
+			m_relation_chain_push_relation(&presentation_chain, &rel);
+			m_relation_chain_push_pose_if_not_identity(&presentation_chain, &from_raw);
+			m_relation_chain_push_pose_if_not_identity(&presentation_chain, offset);
+			m_relation_chain_resolve(&presentation_chain, &rel);
+			presented = rel.pose;
+
+			// Telemetry dev1/2 delta7 is the FULL rigid transform in the final origin frame:
+			// C_origin = origin * C_raw * inverse(origin); raw = inverse(C_origin)*presented.
+			struct xrt_pose inv_origin, temp, origin_correction;
+			math_pose_invert(offset, &inv_origin);
+			math_pose_transform(offset, &from_raw, &temp);
+			math_pose_transform(&temp, &inv_origin, &origin_correction);
+			delta7[0]=origin_correction.position.x; delta7[1]=origin_correction.position.y;
+			delta7[2]=origin_correction.position.z; delta7[3]=origin_correction.orientation.x;
+			delta7[4]=origin_correction.orientation.y; delta7[5]=origin_correction.orientation.z;
+			delta7[6]=origin_correction.orientation.w;
+		} else {
+			// Devices without the paired API keep their existing presentation behavior.
+			rel = raw_in_origin;
 			std::lock_guard<std::mutex> lk(g_world_guard.lock);
 			u_world_reanchor_apply(&g_world_guard.wr, &rel.pose, &presented);
 			world_guard_pack_delta(g_world_guard.wr, delta7);
@@ -1833,10 +1886,12 @@ CDeviceDriver_Monado::GetRecommendedRenderTargetSize(uint32_t *pnWidth, uint32_t
 	int scale = debug_get_num_option_scale_percentage();
 	float fscale = (float)scale / 100.f;
 
-
-
-	*pnWidth = m_xdev->hmd->screens[0].w_pixels * fscale;
-	*pnHeight = m_xdev->hmd->screens[0].h_pixels * fscale;
+	// OpenVR uses this size for each eye. The view display dimensions are in
+	// client orientation; the screen dimensions cover the entire physical panel.
+	const auto &left = m_xdev->hmd->views[vr::Eye_Left].display;
+	const auto &right = m_xdev->hmd->views[vr::Eye_Right].display;
+	*pnWidth = std::max(left.w_pixels, right.w_pixels) * fscale;
+	*pnHeight = std::max(left.h_pixels, right.h_pixels) * fscale;
 
 	ovrd_log("Render Target Size: %dx%d (%fx)\n", *pnWidth, *pnHeight, fscale);
 }

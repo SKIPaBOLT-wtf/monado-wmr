@@ -10,7 +10,9 @@
  * @ingroup aux_tracking
  */
 
+#pragma once
 #include "xrt/xrt_tracking.h"
+#include "tracking/t_estimator_prior.h"
 
 #include <stddef.h>
 #include <stdbool.h>
@@ -59,6 +61,19 @@ struct kalman_led_camera_view
 	struct xrt_vec3 cam_world_pos;    //!< world->camera translation
 };
 
+//! Read-only historical estimator prior. Missing history is false with an initialized invalid bundle.
+bool
+kalman_fusion_get_estimator_prior(struct KalmanFusionInterfaceWrapper *wrapper, int64_t timestamp_ns,
+                                 struct t_estimator_prior *out_prior);
+uint64_t
+kalman_fusion_get_world_generation(struct KalmanFusionInterfaceWrapper *wrapper);
+//! Pure projection of a frozen prior, with the same Jacobian and pixel noise as the LED update.
+bool
+kalman_fusion_predict_led_gate_from_prior(const struct t_estimator_prior *prior,
+                                         const struct kalman_led_observation *obs,
+                                         const struct kalman_led_camera_view *view,
+                                         float out_zhat[2], float out_S[4]);
+
 struct KalmanFusionInterfaceWrapper *
 kalman_fusion_create(void);
 
@@ -73,6 +88,10 @@ kalman_fusion_process_imu_data(struct KalmanFusionInterfaceWrapper *wrapper,
                                const struct xrt_imu_sample *sample,
                                const struct xrt_vec3 *accel_variance_optional,
                                const struct xrt_vec3 *gyro_variance_optional);
+
+//! A hardware low-power status, not an IMU sample. Holds a recently confirmed rest state until real IMU resumes.
+void
+kalman_fusion_process_idle_status(struct KalmanFusionInterfaceWrapper *wrapper, timepoint_ns timestamp_ns);
 
 //! @p hmd_world_pose is the LIVE HMD pose in the same world frame as the controller (NULL if
 //! unavailable). It lets the fusion gate optical adoption on the controller-to-HMD distance (arm reach),
@@ -210,6 +229,18 @@ kalman_fusion_update_body_anchor(struct KalmanFusionInterfaceWrapper *wrapper, c
 //! (x' = delta.q * x + delta.p) in one detected step (SLAM relocalization/reset). Transforms the
 //! filter's world-frame state so the prior lives in the new world; body-frame state is untouched.
 //! See KalmanFusionInterface::re_anchor_world.
+// Presentation-only pair: hmd_world_pose is the presented IMU reference, expressed in this
+// tracking origin. The relation remains raw; apply out_from_raw rigidly to pose and velocities.
+void
+kalman_fusion_get_prediction_with_presentation(struct KalmanFusionInterfaceWrapper *wrapper,
+    int64_t timestamp_ns, struct xrt_space_relation *out_relation,
+    const struct xrt_pose *hmd_world_pose, struct xrt_pose *out_from_raw, uint64_t *out_generation);
+
+void
+kalman_fusion_re_anchor_world_with_presentation(struct KalmanFusionInterfaceWrapper *wrapper,
+    const struct xrt_pose *delta, const struct xrt_vec3 *new_raw_pivot,
+    int64_t publication_ns, double gyro_dps, double speed_mps);
+
 void
 kalman_fusion_re_anchor_world(struct KalmanFusionInterfaceWrapper *wrapper, const struct xrt_pose *delta);
 

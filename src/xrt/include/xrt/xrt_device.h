@@ -393,6 +393,14 @@ struct xrt_device
 	                                 int64_t at_timestamp_ns,
 	                                 struct xrt_space_relation *out_relation);
 
+	/* Optional presentation-only pair. The raw relation and rigid from_raw correction
+	 * must come from one published snapshot. Tracking/optical consumers use get_tracked_pose. */
+	xrt_result_t (*get_tracked_pose_with_presentation)(struct xrt_device *xdev,
+	    enum xrt_input_name name, int64_t at_timestamp_ns,
+	    struct xrt_space_relation *out_relation, struct xrt_pose *out_from_raw, uint64_t *out_generation,
+	    const struct xrt_pose *presented_hmd_in_tracking);
+
+
 	/*!
 	 * @brief Get relationship of hand joints to the tracking origin space as
 	 * the base space.

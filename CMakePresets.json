@@ -79,6 +79,22 @@
             "cacheVariables": {
                 "CMAKE_BUILD_TYPE": "RelWithDebInfo"
             }
+        },
+        {
+            "name": "g2-stability",
+            "displayName": "Experimental G2 SteamVR driver and offline tests",
+            "generator": "Ninja",
+            "binaryDir": "${sourceDir}/build/g2-stability",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+                "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+                "BUILD_TESTING": "ON",
+                "XRT_FEATURE_STEAMVR_PLUGIN": "ON",
+                "XRT_FEATURE_SLAM": "ON",
+                "XRT_BUILD_DRIVER_WMR": "ON",
+                "XRT_OPENXR_INSTALL_ACTIVE_RUNTIME": "OFF",
+                "CMAKE_INSTALL_PREFIX": "${sourceDir}/build/staged-install"
+            }
         }
     ],
     "buildPresets": [
@@ -87,6 +103,18 @@
             "displayName": "Build and install",
             "configurePreset": "default",
             "targets": "install"
+        },
+        {
+            "name": "g2-stability",
+            "configurePreset": "g2-stability",
+            "targets": [
+                "driver_monado",
+                "tests_kalman_fusion",
+                "tests_world_reanchor",
+                "tests_wmr_config",
+                "tests_wmr_protocol",
+                "tests_wmr_camera_footer"
+            ]
         }
     ]
 }

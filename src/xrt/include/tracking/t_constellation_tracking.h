@@ -14,6 +14,7 @@
 
 #include "os/os_threading.h"
 #include "tracking/t_tracking.h"
+#include "tracking/t_estimator_prior.h"
 #include "tracking/t_led_models.h"
 #include "util/u_sink.h"
 #include "xrt/xrt_device.h"
@@ -110,6 +111,17 @@ struct t_constellation_cam_calib
 
 struct t_constellation_tracked_device_callbacks
 {
+	//! Capture one immutable prior before ROI/association. True means this interface is supported;
+	//! out->valid=false means cold search, NOT disconnected or a rendered-pose fallback.
+	bool (*get_estimator_prior)(struct xrt_device *xdev, timepoint_ns when_ns, struct t_estimator_prior *out);
+	//! Called under the SAME connection lock as the ensuing observation callback and world reanchor.
+	//! The token belongs to this device, including when history is missing at cold start.
+	bool (*validate_prior_epoch)(struct xrt_device *xdev, const struct t_estimator_prior *prior);
+	//! Pure projection from the frozen bundle and this exposure's frozen camera geometry.
+	bool (*predict_led_gate_from_prior)(const struct t_estimator_prior *prior,
+	    const struct xrt_pose *P_xrworld_cam, const struct t_constellation_cam_calib *calib,
+	    const struct xrt_vec3 *led_obj, float out_zhat[2], float out_S[4]);
+
 	bool (*get_led_model)(struct xrt_device *xdev, struct t_constellation_led_model *led_model);
 	void (*notify_frame_received)(struct xrt_device *xdev, uint64_t frame_mono_ns, uint64_t frame_sequence);
 	void (*push_observed_pose)(struct xrt_device *xdev, timepoint_ns frame_mono_ns, const struct xrt_pose *pose);
@@ -177,7 +189,8 @@ struct t_constellation_tracked_device_callbacks
 	//! world-frame fusion state by delta so its prior lands in the NEW world in the same camera
 	//! frame the optical observations do. Optional — may be NULL.
 	void (*notify_world_reanchor)(struct xrt_device *xdev, timepoint_ns frame_mono_ns,
-	                              const struct xrt_pose *delta);
+	                             const struct xrt_pose *delta, const struct xrt_vec3 *new_raw_pivot,
+	                             timepoint_ns publication_ns, double gyro_dps, double speed_mps);
 };
 
 struct t_constellation_tracked_device_connection *

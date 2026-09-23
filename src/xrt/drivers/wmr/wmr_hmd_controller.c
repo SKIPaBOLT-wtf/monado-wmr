@@ -74,7 +74,7 @@ read_sync_from_controller(struct wmr_controller_connection *wcc, uint8_t *buffer
 		conn->busy += 1;
 		os_mutex_unlock(&conn->lock);
 
-		res = wmr_hmd_read_sync_from_controller(conn->hmd, buffer, buf_size, timeout_ms);
+		res = wmr_hmd_read_sync_from_controller(conn->hmd, conn->hmd_cmd_base, buffer, buf_size, timeout_ms);
 		if (res > 0) {
 			buffer[0] -= conn->hmd_cmd_base;
 		}

@@ -44,6 +44,7 @@
 #include <opencv2/core/version.hpp>
 
 #include <cmath>
+#include <cfloat>
 #include <cstdlib>
 #include <deque>
 #include <filesystem>
@@ -95,6 +96,8 @@ DEBUG_GET_ONCE_BOOL_OPTION(slam_write_csvs, "SLAM_WRITE_CSVS", false)
 DEBUG_GET_ONCE_OPTION(slam_csv_path, "SLAM_CSV_PATH", "evaluation/")
 DEBUG_GET_ONCE_BOOL_OPTION(slam_timing_stat, "SLAM_TIMING_STAT", true)
 DEBUG_GET_ONCE_BOOL_OPTION(slam_features_stat, "SLAM_FEATURES_STAT", true)
+DEBUG_GET_ONCE_BOOL_OPTION(g2_require_visual_observations, "G2_REQUIRE_VISUAL_OBSERVATIONS", false)
+DEBUG_GET_ONCE_BOOL_OPTION(g2_predict_with_vit_bias, "G2_PREDICT_WITH_VIT_BIAS", false)
 DEBUG_GET_ONCE_NUM_OPTION(slam_cam_count, "SLAM_CAM_COUNT", 2)
 
 //! Namespace for the interface to the external SLAM tracking system
@@ -156,6 +159,20 @@ struct feature_count_sample
 	timepoint_ns ts;
 	vector<int> counts;
 };
+
+struct gyro_bias_sample
+{
+	timepoint_ns ts;
+	bool valid;
+	xrt_vec3 bias;
+};
+
+ostream &
+operator<<(ostream &os, const gyro_bias_sample &s)
+{
+	os << s.ts << "," << s.valid << "," << s.bias.x << "," << s.bias.y << "," << s.bias.z << CSV_EOL;
+	return os;
+}
 
 ostream &
 operator<<(ostream &os, const feature_count_sample &s)
@@ -307,20 +324,26 @@ struct TrackerSlam
 	//! Type of prediction to use
 	t_slam_prediction_type pred_type;
 	u_var_combo pred_combo;         //!< UI combo box to select @ref pred_type
+	Mutex pose_mutex; //!< serializes VIT queue draining, prediction/filter output and explicit reset
+	int slam_consec_bad = 0; //!< guarded by pose_mutex, owned by this tracker
+	bool require_visual_observations = false; //!< explicit G2 opt-in; zero current-frame observations invalidate pose
+	bool visual_observations_available = false; //!< extension successfully enabled before streaming
+	bool use_pose_gyro_bias = false; //!< Optional vendor ABI; calibrated IMU-frame gyro only.
+	gyro_bias_sample latest_gyro_bias{}; //!< Belongs to the actually accepted latest relation, under pose_mutex.
 	RelationHistory slam_rels{};    //!< A history of relations produced purely from external SLAM tracker data
 	int dbg_pred_every = 1;         //!< Skip X SLAM poses so that you get tracked mostly by the prediction algo
 	int dbg_pred_counter = 0;       //!< SLAM pose counter for prediction debugging
 	struct os_mutex lock_ff;        //!< Lock for gyro_ff and accel_ff.
 	struct m_ff_vec3_f32 *gyro_ff;  //!< Last gyroscope samples
 	struct m_ff_vec3_f32 *accel_ff; //!< Last accelerometer samples
+	struct t_imu_calibration prediction_imu_calib{}; //!< Driver calibration accepted by the tracker.
+	bool have_prediction_imu_calib = false;
 	vector<u_sink_debug> ui_sink;   //!< Sink to display frames in UI of each camera
 
 	//! Used to correct accelerometer measurements when integrating into the prediction.
 	//! @todo Should be automatically computed instead of required to be filled manually through the UI.
 	xrt_vec3 gravity_correction{0, 0, -MATH_GRAVITY_M_S2};
 
-	struct xrt_space_relation last_rel = XRT_SPACE_RELATION_ZERO; //!< Last reported/tracked pose
-	timepoint_ns last_ts;                                         //!< Last reported/tracked pose timestamp
 
 	//! Filters are used to smooth out the resulting trajectory
 	struct
@@ -354,6 +377,7 @@ struct TrackerSlam
 	// CSV writers for offline analysis (using pointers because of container_of)
 	TimingWriter *slam_times_writer;      //!< Timestamps of the pipeline for performance analysis
 	FeaturesWriter *slam_features_writer; //!< Feature tracking information for analysis
+	CSVWriter<gyro_bias_sample> *gyro_bias_writer; //!< Optional diagnostics; no fitted or synthetic bias.
 	TrajectoryWriter *slam_traj_writer;   //!< Estimated poses from the SLAM system
 	TrajectoryWriter *pred_traj_writer;   //!< Predicted poses
 	TrajectoryWriter *filt_traj_writer;   //!< Predicted and filtered poses
@@ -750,10 +774,55 @@ gt_ui_push(TrackerSlam &t, timepoint_ns ts, xrt_pose tracked_pose)
  *
  */
 
+//! -1 means unavailable/unknown, never zero. Positive counts are not a quality guarantee.
+//! Basalt's feature extension enumerates landmark observations for this pose's current frame.
+static int64_t
+visual_observation_count(TrackerSlam &t, const vit_pose_t *pose)
+{
+	if (!t.require_visual_observations || !t.visual_observations_available || t.cam_count == 0) {
+		return -1;
+	}
+	int64_t count = 0;
+	for (uint32_t i = 0; i < t.cam_count; ++i) {
+		vit_pose_features features{};
+		if (t.vit.pose_get_features(pose, i, &features) != VIT_SUCCESS) {
+			return -1;
+		}
+		count += features.count;
+	}
+	return count;
+}
+
+//! Read a copied bias from the same immutable backend pose used by pose_get_data.
+static gyro_bias_sample
+read_pose_gyro_bias(TrackerSlam &t, const vit_pose_t *pose, int64_t ts)
+{
+	gyro_bias_sample sample{ts, false, {}};
+	if (!t.use_pose_gyro_bias || !t.have_prediction_imu_calib || t.vit.g2_pose_get_imu_bias_v1 == nullptr) {
+		return sample;
+	}
+	vit_g2_imu_bias_v1 data{};
+	if (t.vit.g2_pose_get_imu_bias_v1(pose, sizeof(data), &data) != VIT_SUCCESS ||
+	    data.struct_size != sizeof(data) || data.timestamp_ns != ts ||
+	    (data.flags & 1u) == 0 || (data.flags & ~3u) != 0) {
+		return sample;
+	}
+	for (double v : data.gyro_bias_rad_s) {
+		if (!std::isfinite(v) || std::abs(v) > FLT_MAX) {
+			return sample;
+		}
+	}
+	sample.bias = {(float)data.gyro_bias_rad_s[0], (float)data.gyro_bias_rad_s[1],
+	               (float)data.gyro_bias_rad_s[2]};
+	sample.valid = true;
+	return sample;
+}
+
 //! Dequeue all tracked poses from the SLAM system and update prediction data with them.
 static bool
-flush_poses(TrackerSlam &t)
+flush_poses_locked(TrackerSlam &t)
 {
+	// Caller holds pose_mutex across pop, relation publication and dependent output state.
 
 	vit_pose_t *pose = NULL;
 	vit_result_t vres = t.vit.tracker_pop_pose(t.tracker, &pose);
@@ -776,6 +845,7 @@ flush_poses(TrackerSlam &t)
 		}
 
 		int64_t nts = data.timestamp;
+		const bool no_visual_observations = visual_observation_count(t, pose) == 0;
 
 		xrt_vec3 npos{data.px, data.py, data.pz};
 		xrt_quat nrot{data.ox, data.oy, data.oz, data.ow};
@@ -786,7 +856,6 @@ flush_poses(TrackerSlam &t)
 		// corrupts the relation history (the head then "diverges forever until reset"). Drop bad
 		// poses; after a sustained run, reset the tracker so the head self-heals. Head-side analogue
 		// of the controller optical-jump gate.
-		static int slam_consec_bad = 0;
 		static const int SLAM_MAX_CONSEC_BAD = 30; // ~1 s of bad poses before forcing a reset
 		bool pose_finite = std::isfinite(npos.x) && std::isfinite(npos.y) && std::isfinite(npos.z) &&
 		                   std::isfinite(nrot.x) && std::isfinite(nrot.y) && std::isfinite(nrot.z) &&
@@ -794,26 +863,37 @@ flush_poses(TrackerSlam &t)
 		                   std::isfinite(nvel.z);
 		bool pose_insane = pose_finite && m_vec3_len(npos) > 1000.0f; // room-scale; >1 km = diverged
 		if (!pose_finite || pose_insane) {
-			slam_consec_bad++;
+			if (no_visual_observations) {
+				xrt_space_relation unavailable{};
+				unavailable.pose.orientation.w = 1;
+				if (t.slam_rels.push(unavailable, nts)) {
+					t.latest_gyro_bias = {nts, false, {}};
+					t.gyro_bias_writer->push(t.latest_gyro_bias);
+				}
+			}
+			t.slam_consec_bad++;
 			SLAM_WARN("Dropping divergent SLAM pose (finite=%d |p|=%.1f m) %d/%d", pose_finite,
-			          pose_finite ? (double)m_vec3_len(npos) : 0.0, slam_consec_bad, SLAM_MAX_CONSEC_BAD);
-			if (slam_consec_bad >= SLAM_MAX_CONSEC_BAD) {
+			          pose_finite ? (double)m_vec3_len(npos) : 0.0, t.slam_consec_bad, SLAM_MAX_CONSEC_BAD);
+			if (t.slam_consec_bad >= SLAM_MAX_CONSEC_BAD) {
+				t.latest_gyro_bias = {};
 				if (t.vit.tracker_reset(t.tracker) != VIT_SUCCESS) {
 					SLAM_WARN("Auto-reset of diverged VIT tracker failed");
 				} else {
 					SLAM_INFO("Auto-reset VIT tracker after sustained divergence");
 				}
-				slam_consec_bad = 0;
+				t.slam_consec_bad = 0;
 			}
 			t.vit.pose_destroy(pose);
 			continue;
 		}
-		slam_consec_bad = 0;
+		t.slam_consec_bad = 0;
 
 		// Last relation
 		xrt_space_relation lr = XRT_SPACE_RELATION_ZERO;
-		int64_t lts;
+		int64_t lts = 0;
 		bool have_last = t.slam_rels.get_latest(&lts, &lr);
+		const bool have_last_orientation = have_last &&
+		    (lr.relation_flags & XRT_SPACE_RELATION_ORIENTATION_VALID_BIT) != 0;
 		xrt_quat lrot = lr.pose.orientation;
 
 		double dt = time_ns_to_s(nts - lts);
@@ -826,7 +906,11 @@ flush_poses(TrackerSlam &t)
 		rel.relation_flags = XRT_SPACE_RELATION_BITMASK_ALL;
 		rel.pose = {nrot, npos};
 		rel.linear_velocity = nvel;
-		math_quat_finite_difference(&lrot, &nrot, dt, &rel.angular_velocity);
+		if (!no_visual_observations && have_last_orientation && dt > 0.0) {
+			math_quat_finite_difference(&lrot, &nrot, dt, &rel.angular_velocity);
+		} else {
+			rel.relation_flags = (xrt_space_relation_flags)(rel.relation_flags & ~XRT_SPACE_RELATION_ANGULAR_VELOCITY_VALID_BIT);
+		}
 
 		// A relocalization/reset step turns this finite difference into an angular-velocity
 		// artifact (worst recorded event: 59.3 deg over 66.8 ms = a ~890 dps "velocity" for one
@@ -834,7 +918,7 @@ flush_poses(TrackerSlam &t)
 		// rate when the step's rotation exceeds the envelope (the same innovation test the world
 		// re-anchor guard uses); the true post-step angular velocity is re-established by the
 		// next sample pair.
-		if (have_last && dt > 0.0) {
+		if (!no_visual_observations && have_last_orientation && dt > 0.0) {
 			double gyro_int_deg = 0.0;
 			os_mutex_lock(&t.lock_ff);
 			uint64_t seg_end_ns = (uint64_t)nts;
@@ -871,15 +955,26 @@ flush_poses(TrackerSlam &t)
 			}
 		}
 
+		if (no_visual_observations) {
+			// A pose without any current-frame landmark observation is not an observed
+			// room pose. Keep raw diagnostics below, but never publish its inertial drift.
+			rel = {};
+			rel.pose.orientation.w = 1;
+		}
+
 		// Push to relationship history unless we are debugging prediction
-		if (t.dbg_pred_counter % t.dbg_pred_every == 0) {
-			t.slam_rels.push(rel, nts);
+		if (no_visual_observations || t.dbg_pred_counter % t.dbg_pred_every == 0) {
+			if (t.slam_rels.push(rel, nts)) {
+				t.latest_gyro_bias = no_visual_observations ? gyro_bias_sample{nts, false, {}}
+				                                          : read_pose_gyro_bias(t, pose, nts);
+				t.gyro_bias_writer->push(t.latest_gyro_bias);
+			}
 		}
 		t.dbg_pred_counter = (t.dbg_pred_counter + 1) % t.dbg_pred_every;
 
 		gt_ui_push(t, nts, rel.pose);
-		t.slam_traj_writer->push({nts, rel.pose});
-		xrt_pose_sample pose_sample = {nts, rel.pose};
+		t.slam_traj_writer->push({nts, {nrot, npos}});
+		xrt_pose_sample pose_sample = {nts, {nrot, npos}};
 		xrt_sink_push_pose(t.euroc_recorder->gt, &pose_sample);
 
 		auto tss = timing_ui_push(t, pose, nts);
@@ -894,6 +989,15 @@ flush_poses(TrackerSlam &t)
 	} while (t.vit.tracker_pop_pose(t.tracker, &pose) == VIT_SUCCESS && pose);
 
 	return true;
+}
+
+//! Camera delivery may drain independently of device queries. VIT specifies one queue consumer;
+//! retain the mutex through relation publication so a later popped pose cannot overtake an earlier one.
+static bool
+flush_poses(TrackerSlam &t)
+{
+	unique_lock lock(t.pose_mutex);
+	return flush_poses_locked(t);
 }
 
 //! Return our best guess of the relation at time @p when_ns using all the data the tracker has.
@@ -930,13 +1034,25 @@ predict_pose(TrackerSlam &t, timepoint_ns when_ns, struct xrt_space_relation *ou
 	}
 
 
+	// Unobserved future poses must not acquire validity from later IMU integration.
+	// Historical queries above retain the validity of the pose at their own time.
+	if (rel.relation_flags == XRT_SPACE_RELATION_BITMASK_NONE) {
+		*out_relation = rel;
+		return;
+	}
+	const xrt_vec3 *gyro_bias = t.use_pose_gyro_bias && t.latest_gyro_bias.valid &&
+	                                    t.latest_gyro_bias.ts == rel_ts
+	                                ? &t.latest_gyro_bias.bias
+	                                : nullptr;
+
 	if (t.pred_type == SLAM_PRED_DEAD_RECKONING) {
 		os_mutex_lock(&t.lock_ff);
 
-		t_apply_dead_reckoning(    //
+		t_apply_dead_reckoning_with_gyro_bias( //
 		    t.gyro_ff,             //
 		    t.accel_ff,            //
 		    &t.gravity_correction, //
+		    gyro_bias,             //
 		    when_ns,               //
 		    &rel,                  //
 		    (int64_t)rel_ts,       //
@@ -952,6 +1068,9 @@ predict_pose(TrackerSlam &t, timepoint_ns when_ns, struct xrt_space_relation *ou
 	if (t.pred_type >= SLAM_PRED_GYRO) {
 		xrt_vec3 avg_gyro{};
 		m_ff_vec3_f32_filter(t.gyro_ff, rel_ts, when_ns, &avg_gyro);
+		if (gyro_bias != nullptr) {
+			avg_gyro -= *gyro_bias;
+		}
 		math_quat_rotate_derivative(&rel.pose.orientation, &avg_gyro, &rel.angular_velocity);
 	}
 
@@ -1053,7 +1172,9 @@ setup_ui(TrackerSlam &t)
 
 	u_var_button_cb reset_state_cb = [](void *t_ptr) {
 		TrackerSlam &t = *(TrackerSlam *)t_ptr;
+		unique_lock lock(t.pose_mutex);
 
+		t.latest_gyro_bias = {};
 		vit_result_t vres = t.vit.tracker_reset(t.tracker);
 		if (vres != VIT_SUCCESS) {
 			SLAM_WARN("Failed to reset VIT tracker");
@@ -1173,7 +1294,7 @@ add_camera_calibration(const TrackerSlam &t, const t_slam_camera_calibration *ca
 }
 
 static void
-add_imu_calibration(const TrackerSlam &t, const t_slam_imu_calibration *imu_calib)
+add_imu_calibration(TrackerSlam &t, const t_slam_imu_calibration *imu_calib)
 {
 	vit_imu_calibration_t params = {};
 	params.imu_index = 0;
@@ -1196,11 +1317,14 @@ add_imu_calibration(const TrackerSlam &t, const t_slam_imu_calibration *imu_cali
 	vit_result_t vres = t.vit.tracker_add_imu_calibration(t.tracker, &params);
 	if (vres != VIT_SUCCESS) {
 		SLAM_ERROR("Failed to add imu calibration");
+	} else {
+		t.prediction_imu_calib = imu_calib->base;
+		t.have_prediction_imu_calib = true;
 	}
 }
 
 static void
-send_calibration(const TrackerSlam &t, const t_slam_calibration &c)
+send_calibration(TrackerSlam &t, const t_slam_calibration &c)
 {
 	// Try to send camera calibration data to the SLAM system
 	if (t.exts.has_add_camera_calibration) {
@@ -1239,14 +1363,12 @@ t_slam_get_tracked_pose(struct xrt_tracked_slam *xts, timepoint_ns when_ns, stru
 
 	auto &t = *container_of(xts, TrackerSlam, base);
 
-	//! @todo This should not be cached, the same timestamp can be requested at a
-	//! later time on the frame for a better prediction.
-	if (when_ns == t.last_ts) {
-		*out_relation = t.last_rel;
-		return;
-	}
-
-	flush_poses(t);
+	// One transaction covers draining, query, optional output filters and publication. Even an
+	// equal-time query must see newly arrived VIT/IMU data; timestamp-only caching was stale and racy.
+	unique_lock lock(t.pose_mutex);
+	*out_relation = XRT_SPACE_RELATION_ZERO;
+	out_relation->pose.orientation.w = 1;
+	flush_poses_locked(t);
 
 	predict_pose(t, when_ns, out_relation);
 	t.pred_traj_writer->push({when_ns, out_relation->pose});
@@ -1254,8 +1376,6 @@ t_slam_get_tracked_pose(struct xrt_tracked_slam *xts, timepoint_ns when_ns, stru
 	filter_pose(t, when_ns, out_relation);
 	t.filt_traj_writer->push({when_ns, out_relation->pose});
 
-	t.last_rel = *out_relation;
-	t.last_ts = when_ns;
 
 	if (t.gt.override_tracking) {
 		out_relation->pose = gt2xr_pose(t.gt.origin, get_gt_pose_at(*t.gt.trajectory, when_ns));
@@ -1301,6 +1421,23 @@ t_slam_controller_mask_sink_push(struct xrt_device_masks_sink *sink, struct xrt_
 	t.last_controller_masks = *controller_masks;
 }
 
+//! Apply driver calibration only to the local prediction copy of a raw sample.
+static xrt_vec3
+calibrate_prediction_sample(const t_inertial_calibration &calib, const xrt_vec3_f64 &raw)
+{
+	// Basalt's VIT implementation uses M * raw - offset, with the offset outside M.
+	// The WMR driver supplies -factory_bias as offset. Keep all factory matrix terms.
+	const double input[3] = {raw.x, raw.y, raw.z};
+	double output[3];
+	for (int row = 0; row < 3; row++) {
+		output[row] = -calib.offset[row];
+		for (int col = 0; col < 3; col++) {
+			output[row] += calib.transform[row][col] * input[col];
+		}
+	}
+	return {(float)output[0], (float)output[1], (float)output[2]};
+}
+
 //! Receive and send IMU samples to the external SLAM system
 extern "C" void
 t_slam_receive_imu(struct xrt_imu_sink *sink, struct xrt_imu_sample *s)
@@ -1342,6 +1479,12 @@ t_slam_receive_imu(struct xrt_imu_sink *sink, struct xrt_imu_sample *s)
 
 	struct xrt_vec3 gyro = {(float)w.x, (float)w.y, (float)w.z};
 	struct xrt_vec3 accel = {(float)a.x, (float)a.y, (float)a.z};
+	// VIT and the recorder above still receive raw samples. Prediction needs calibrated
+	// samples, since its pose and velocity came from the calibrated tracker estimate.
+	if (t.have_prediction_imu_calib) {
+		gyro = calibrate_prediction_sample(t.prediction_imu_calib.gyro, w);
+		accel = calibrate_prediction_sample(t.prediction_imu_calib.accel, a);
+	}
 	os_mutex_lock(&t.lock_ff);
 	m_ff_vec3_f32_push(t.gyro_ff, &gyro, ts);
 	m_ff_vec3_f32_push(t.accel_ff, &accel, ts);
@@ -1498,6 +1641,7 @@ t_slam_node_destroy(struct xrt_frame_node *node)
 	delete t.gt.trajectory;
 	delete t.slam_times_writer;
 	delete t.slam_features_writer;
+	delete t.gyro_bias_writer;
 	delete t.slam_traj_writer;
 	delete t.pred_traj_writer;
 	delete t.filt_traj_writer;
@@ -1678,11 +1822,39 @@ t_slam_create(struct xrt_frame_context *xfctx,
 	string dir = config->csv_path;
 	t.slam_times_writer = new TimingWriter(dir, "timing.csv", write_csvs, t.timing.columns);
 	t.slam_features_writer = new FeaturesWriter(dir, "features.csv", write_csvs, t.cam_count);
+	t.gyro_bias_writer = new CSVWriter<gyro_bias_sample>(dir, "gyro-bias.csv", write_csvs,
+	    {"timestamp", "valid", "gyro_bias_x_rad_s", "gyro_bias_y_rad_s", "gyro_bias_z_rad_s"});
 	t.slam_traj_writer = new TrajectoryWriter(dir, "tracking.csv", write_csvs);
 	t.pred_traj_writer = new TrajectoryWriter(dir, "prediction.csv", write_csvs);
 	t.filt_traj_writer = new TrajectoryWriter(dir, "filtering.csv", write_csvs);
 
 	setup_ui(t);
+	t.use_pose_gyro_bias = debug_get_bool_option_g2_predict_with_vit_bias();
+	if (t.use_pose_gyro_bias && !t.have_prediction_imu_calib) {
+		SLAM_WARN("Pose gyro bias requested without matching driver IMU calibration; retaining existing prediction");
+		t.use_pose_gyro_bias = false;
+	}
+	if (t.use_pose_gyro_bias) {
+		if (t.vit.g2_pose_get_imu_bias_v1 != nullptr) {
+			SLAM_INFO("Pose-coupled learned gyro bias enabled for prediction; accelerometer path unchanged");
+		} else {
+			SLAM_WARN("Pose gyro bias requested but unavailable; retaining existing prediction");
+		}
+	}
+
+	t.require_visual_observations = debug_get_bool_option_g2_require_visual_observations();
+	if (t.require_visual_observations) {
+		if (t.exts.has_pose_features &&
+		    t.vit.tracker_enable_extension(t.tracker, VIT_TRACKER_EXTENSION_POSE_FEATURES, true) == VIT_SUCCESS) {
+			t.visual_observations_available = true;
+			t.features.enabled = true;
+			// The extension now supplies pose validity, not just the optional debug graph.
+			t.features.enable_btn.disabled = true;
+			SLAM_INFO("Current-frame visual observation validation enabled");
+		} else {
+			SLAM_WARN("Visual observation validation requested but unsupported; observation status is unknown");
+		}
+	}
 
 	// Setup OpenVR groundtruth tracker
 	if (config->openvr_groundtruth_device > 0) {

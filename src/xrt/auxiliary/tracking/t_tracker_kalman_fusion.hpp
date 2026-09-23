@@ -37,12 +37,22 @@ using LEDObservation = ::kalman_led_observation;
 //! world frame to the camera frame (caller folds in the YZ flip).
 using LEDCameraView = ::kalman_led_camera_view;
 
+bool
+predict_led_gate_from_prior(const t_estimator_prior &prior, const LEDObservation &obs,
+                           const LEDCameraView &view, float out_zhat[2], float out_S[4]);
+
 class KalmanFusionInterface
 {
 public:
 	static std::unique_ptr<KalmanFusionInterface>
 	create();
 	virtual ~KalmanFusionInterface() = default;
+
+	virtual bool
+	get_estimator_prior(timepoint_ns when_ns, t_estimator_prior *out_prior) = 0;
+	virtual uint64_t
+	get_world_generation() = 0;
+
 
 	virtual void
 	add_ui(void *root, const char *device_name) = 0;
@@ -58,6 +68,9 @@ public:
 	process_imu_data(const struct xrt_imu_sample *sample,
 	                 const struct xrt_vec3 *accel_variance_optional,
 	                 const struct xrt_vec3 *gyro_variance_optional) = 0;
+	//! Hardware status without an IMU measurement; may confirm a recently established stationary state.
+	virtual void
+	process_idle_status(timepoint_ns timestamp_ns) = 0;
 	virtual void
 	process_pose(const struct xrt_pose_sample *sample,
 	             const struct xrt_vec3 *position_variance_optional,
@@ -133,7 +146,10 @@ public:
 	virtual void
 	get_prediction(const timepoint_ns when_ns,
 	               struct xrt_space_relation *out_relation,
-	               const struct xrt_pose *hmd_world_pose) = 0;
+	               const struct xrt_pose *hmd_world_pose,
+	               struct xrt_pose *out_from_raw = nullptr,
+	               uint64_t *out_generation = nullptr,
+	               bool hmd_pose_is_presented = false) = 0;
 
 	/*!
 	 * Raw predicted pose for a CONSUMER OF THE ESTIMATE (the constellation matcher's prior), as opposed to
@@ -361,6 +377,10 @@ public:
 	 * A frame-exact linear transform: body-frame state (IMU biases, intrinsics) and
 	 * head-relative logic are untouched, and delta == identity is a no-op.
 	 */
+	virtual void
+	re_anchor_world_with_presentation(const struct xrt_pose *delta, const struct xrt_vec3 *new_raw_pivot,
+	                                  timepoint_ns publication_ns, double gyro_dps, double speed_mps) = 0;
+
 	virtual void
 	re_anchor_world(const struct xrt_pose *delta)
 	{

@@ -81,6 +81,10 @@ DEBUG_GET_ONCE_NUM_OPTION(sleep_seconds, "WMR_DISPLAY_INIT_SLEEP_SECONDS", 4)
 //! Specifies whether the user wants to use the hand tracker.
 DEBUG_GET_ONCE_BOOL_OPTION(wmr_handtracking, "WMR_HANDTRACKING", true)
 
+//! Log bounded statistics of the calibrated samples actually supplied to fusion.
+DEBUG_GET_ONCE_BOOL_OPTION(wmr_imu_diagnostics, "WMR_IMU_DIAGNOSTICS", false)
+DEBUG_GET_ONCE_OPTION(wmr_config_snapshot, "WMR_CONFIG_SNAPSHOT", NULL)
+
 #ifdef XRT_FEATURE_SLAM
 //! Whether to submit samples to the SLAM tracker from the start.
 DEBUG_GET_ONCE_OPTION(slam_submit_from_start, "SLAM_SUBMIT_FROM_START", NULL)
@@ -334,7 +338,7 @@ hololens_handle_bt_iface_packet(struct wmr_hmd *wh, const unsigned char *buffer,
 }
 
 static void
-hololens_handle_controller_packet(struct wmr_hmd *wh, const unsigned char *buffer, int size)
+hololens_handle_controller_packet(struct wmr_hmd *wh, const unsigned char *buffer, int size, uint64_t received_ns)
 {
 	if (size < 45) {
 		WMR_TRACE(wh, "Got unknown short controller packet (%i)\n\t%02x", size, buffer[0]);
@@ -353,8 +357,7 @@ hololens_handle_controller_packet(struct wmr_hmd *wh, const unsigned char *buffe
 	if (controller == NULL)
 		return; /* Controller online message not yet seen */
 
-	uint64_t now_ns = os_monotonic_get_ns();
-	wmr_controller_connection_receive_bytes(controller, now_ns, (uint8_t *)buffer, size);
+	wmr_controller_connection_receive_bytes(controller, received_ns, (uint8_t *)buffer, size);
 }
 
 static void
@@ -379,6 +382,56 @@ hololens_handle_debug(struct wmr_hmd *wh, const unsigned char *buffer, int size)
 	int msg_len = size - 12;
 
 	WMR_DEBUG(wh, "HMD debug: TS %f seq %u src %d: %.*s", timestamp / 1000.0, seq, src_tag, msg_len, buffer);
+}
+
+static void
+wmr_hmd_note_imu_diagnostics(struct wmr_hmd *wh,
+                            uint64_t now_ns,
+                            const struct xrt_vec3 *accel,
+                            const struct xrt_vec3 *gyro)
+{
+	if (!debug_get_bool_option_wmr_imu_diagnostics()) {
+		return;
+	}
+
+	struct wmr_imu_diagnostics *d = &wh->imu_diagnostics;
+	if (now_ns < d->next_window_ns) {
+		return;
+	}
+
+	double a = sqrt((double)accel->x * accel->x + (double)accel->y * accel->y + (double)accel->z * accel->z);
+	double g = sqrt((double)gyro->x * gyro->x + (double)gyro->y * gyro->y + (double)gyro->z * gyro->z);
+	if (d->sample_count == 0) {
+		d->window_start_ns = now_ns;
+		d->accel_mean = d->accel_m2 = d->gyro_mean = d->gyro_max = 0.0;
+		d->accel_min = d->accel_max = a;
+	}
+
+	d->sample_count++;
+	double delta = a - d->accel_mean;
+	d->accel_mean += delta / (double)d->sample_count;
+	d->accel_m2 += delta * (a - d->accel_mean);
+	d->accel_min = fmin(d->accel_min, a);
+	d->accel_max = fmax(d->accel_max, a);
+	d->gyro_mean += (g - d->gyro_mean) / (double)d->sample_count;
+	d->gyro_max = fmax(d->gyro_max, g);
+
+	uint64_t elapsed_ns = now_ns - d->window_start_ns;
+	if (elapsed_ns < 2 * U_TIME_1S_IN_NS) {
+		return;
+	}
+
+	double seconds = time_ns_to_s(elapsed_ns);
+	// Explicit opt-in logging remains visible even with WMR_LOG=warn; never hold the fusion lock here.
+	U_LOG_XDEV_I(&wh->base,
+	             "WMR IMU diagnostics: %.3f s, %" PRIu64 " samples, %.1f Hz; "
+	             "|accel| mean=%.6f std=%.6f range=[%.6f, %.6f] m/s^2; "
+	             "|gyro| mean=%.6f max=%.6f rad/s; accel_scale=%.9f",
+	             seconds, d->sample_count, (double)(d->sample_count - 1) / seconds, d->accel_mean,
+	             sqrt(fmax(0.0, d->accel_m2 / (double)d->sample_count)), d->accel_min, d->accel_max,
+	             d->gyro_mean, d->gyro_max, (double)wh->accel_scale);
+	d->sample_count = 0;
+	d->next_window_ns = now_ns + 3ULL * U_TIME_1S_IN_NS;
 }
 
 static void
@@ -414,6 +467,7 @@ hololens_handle_sensors_avg(struct wmr_hmd *wh, const unsigned char *buffer, int
 	math_vec3_accum(&wh->config.sensors.gyro.bias_offsets, &avg_calib_gyro);
 	math_quat_rotate_vec3(&wh->config.sensors.transforms.P_oxr_acc.orientation, &avg_calib_accel, &avg_calib_accel);
 	math_quat_rotate_vec3(&wh->config.sensors.transforms.P_oxr_gyr.orientation, &avg_calib_gyro, &avg_calib_gyro);
+	wmr_hmd_note_imu_diagnostics(wh, now_ns, &avg_calib_accel, &avg_calib_gyro);
 
 	// Fusion tracking
 	os_mutex_lock(&wh->fusion.mutex);
@@ -456,6 +510,7 @@ hololens_handle_sensors_all(struct wmr_hmd *wh, const unsigned char *buffer, int
 		math_matrix_3x3_transform_vec3(&wh->config.sensors.accel.mix_matrix, ra, ca);
 		math_vec3_accum(&wh->config.sensors.accel.bias_offsets, ca);
 		math_quat_rotate_vec3(&wh->config.sensors.transforms.P_oxr_acc.orientation, ca, ca);
+		wmr_hmd_note_imu_diagnostics(wh, now_ns, ca, cg);
 	}
 
 	// Fusion tracking
@@ -498,33 +553,20 @@ hololens_handle_sensors(struct wmr_hmd *wh, const unsigned char *buffer, int siz
 	}
 }
 
-static bool
-hololens_sensors_read_packets(struct wmr_hmd *wh)
+//! Normal HID dispatch, shared by the outer reader and safe report types during firmware waits.
+static void
+hololens_dispatch_packet(struct wmr_hmd *wh, const unsigned char *buffer, int size, uint64_t received_ns)
 {
-	DRV_TRACE_MARKER();
-
-	WMR_TRACE(wh, " ");
-
-	unsigned char buffer[WMR_FEATURE_BUFFER_SIZE];
-
-	// Block for 100ms
-	os_mutex_lock(&wh->hid_lock);
-	int size = os_hid_read(wh->hid_hololens_sensors_dev, buffer, sizeof(buffer), 100);
-	os_mutex_unlock(&wh->hid_lock);
-
-	if (size < 0) {
-		WMR_ERROR(wh, "Error reading from Hololens Sensors device. Call to os_hid_read returned %i", size);
-		return false;
+	if (size <= 0) {
+		return;
 	}
-	if (size == 0) {
-		WMR_TRACE(wh, "No more data to read");
-		return true; // No more messages, return.
-	} else {
-		WMR_TRACE(wh, "Read %u bytes", size);
-	}
-
 	switch (buffer[0]) {
 	case WMR_MS_HOLOLENS_MSG_SENSORS: //
+		// The decoder returns without modifying wh->packet on a bad size. Never replay it.
+		if (size != 381 && size != 497) {
+			WMR_WARN(wh, "Ignoring malformed HMD sensor report of %d bytes", size);
+			break;
+		}
 		hololens_handle_sensors(wh, buffer, size);
 		break;
 	case WMR_MS_HOLOLENS_MSG_BT_IFACE: //
@@ -532,7 +574,7 @@ hololens_sensors_read_packets(struct wmr_hmd *wh)
 		break;
 	case WMR_MS_HOLOLENS_MSG_LEFT_CONTROLLER:
 	case WMR_MS_HOLOLENS_MSG_RIGHT_CONTROLLER: //
-		hololens_handle_controller_packet(wh, buffer, size);
+		hololens_handle_controller_packet(wh, buffer, size, received_ns);
 		break;
 	case WMR_MS_HOLOLENS_MSG_CONTROLLER_STATUS: //
 		hololens_handle_controller_status_packet(wh, buffer, size);
@@ -548,6 +590,51 @@ hololens_sensors_read_packets(struct wmr_hmd *wh)
 		break;
 	}
 
+}
+
+static bool
+hololens_defer_packet(struct wmr_hmd *wh, const unsigned char *buffer, int size, uint64_t received_ns)
+{
+	if (size <= 0 || size > WMR_FEATURE_BUFFER_SIZE ||
+	    wh->pending_report_count >= WMR_PENDING_REPORT_CAPACITY) {
+		return false;
+	}
+	uint32_t tail = (wh->pending_report_head + wh->pending_report_count) % WMR_PENDING_REPORT_CAPACITY;
+	struct wmr_pending_report *pending = &wh->pending_reports[tail];
+	pending->received_ns = received_ns;
+	pending->size = (uint32_t)size;
+	memcpy(pending->data, buffer, (size_t)size);
+	wh->pending_report_count++;
+	return true;
+}
+
+static bool
+hololens_sensors_read_packets(struct wmr_hmd *wh)
+{
+	DRV_TRACE_MARKER();
+
+	unsigned char buffer[WMR_FEATURE_BUFFER_SIZE];
+	uint64_t received_ns;
+	int size;
+	if (wh->pending_report_count > 0) {
+		// Pop BEFORE dispatch: an online status may create a controller and defer more reports.
+		struct wmr_pending_report *pending = &wh->pending_reports[wh->pending_report_head];
+		size = (int)pending->size;
+		received_ns = pending->received_ns;
+		memcpy(buffer, pending->data, (size_t)size);
+		wh->pending_report_head = (wh->pending_report_head + 1) % WMR_PENDING_REPORT_CAPACITY;
+		wh->pending_report_count--;
+	} else {
+		os_mutex_lock(&wh->hid_lock);
+		size = os_hid_read(wh->hid_hololens_sensors_dev, buffer, sizeof(buffer), 100);
+		os_mutex_unlock(&wh->hid_lock);
+		received_ns = os_monotonic_get_ns();
+	}
+	if (size < 0) {
+		WMR_ERROR(wh, "Error reading from Hololens Sensors device. Call to os_hid_read returned %i", size);
+		return false;
+	}
+	hololens_dispatch_packet(wh, buffer, size, received_ns);
 	return true;
 }
 
@@ -1071,6 +1158,15 @@ wmr_read_config(struct wmr_hmd *wh)
 	}
 
 	WMR_DEBUG(wh, "JSON config:\n%s", config_json_block);
+	const char *snapshot_path = debug_get_option_wmr_config_snapshot();
+	if (snapshot_path != NULL) {
+		FILE *snapshot = fopen(snapshot_path, "wb");
+		if (snapshot != NULL) {
+			fwrite(config_json_block, 1, strnlen((char *)config_json_block,
+			                                  hdr->json_size - sizeof(uint16_t)), snapshot);
+			fclose(snapshot);
+		}
+	}
 
 	if (!wmr_hmd_config_parse(&wh->config, (char *)config_json_block, wh->log_level)) {
 		free(data);
@@ -1101,15 +1197,18 @@ wmr_hmd_get_3dof_tracked_pose(struct xrt_device *xdev,
 	uint64_t last_imu_timestamp_ns = 0;
 	struct xrt_space_relation relation = {0};
 	relation.relation_flags = XRT_SPACE_RELATION_BITMASK_ALL;
-	relation.pose.position = wh->pose.position;
 	relation.linear_velocity = (struct xrt_vec3){0, 0, 0};
 
-	// Get data while holding the lock.
+	// Get data and the shared SLAM/3DoF pose seed while holding the same lock.
 	os_mutex_lock(&wh->fusion.mutex);
+	relation.pose.position = wh->pose.position;
 	relation.pose.orientation = wh->fusion.i3dof.rot;
 	relation.angular_velocity = wh->fusion.last_angular_velocity;
 	last_imu_timestamp_ns = wh->fusion.last_imu_timestamp_ns;
 	os_mutex_unlock(&wh->fusion.mutex);
+
+	// Fusion consumes gyro in headset/body space; relations and prediction use base space.
+	math_quat_rotate_derivative(&relation.pose.orientation, &relation.angular_velocity, &relation.angular_velocity);
 
 	// prediction needed.
 	if (at_timestamp_ns > last_imu_timestamp_ns) {
@@ -1121,7 +1220,9 @@ wmr_hmd_get_3dof_tracked_pose(struct xrt_device *xdev,
 		*out_relation = relation;
 	}
 
+	os_mutex_lock(&wh->fusion.mutex);
 	wh->pose = out_relation->pose;
+	os_mutex_unlock(&wh->fusion.mutex);
 
 	return XRT_SUCCESS;
 }
@@ -1155,6 +1256,60 @@ wmr_hmd_correct_vec3_from_basalt(struct xrt_vec3 v)
 	return v;
 }
 
+//! Convert only components the SLAM provider actually supplies. A valid-but-untracked base pose
+//! is a finite unavailable-history fallback, not permission to substitute a shared previous pose.
+static void
+wmr_hmd_correct_slam_relation(enum xrt_input_name name,
+                              bool imu2me,
+                              const struct xrt_pose *P_imu_me,
+                              struct xrt_space_relation *relation)
+{
+	enum xrt_space_relation_flags flags = relation->relation_flags;
+	const bool supplied_linear_velocity = (flags & XRT_SPACE_RELATION_LINEAR_VELOCITY_VALID_BIT) != 0;
+	const bool orientation_valid = (flags & XRT_SPACE_RELATION_ORIENTATION_VALID_BIT) != 0;
+	const bool position_valid = (flags & XRT_SPACE_RELATION_POSITION_VALID_BIT) != 0;
+	if (!orientation_valid) {
+		flags = (enum xrt_space_relation_flags)(flags & ~XRT_SPACE_RELATION_ORIENTATION_TRACKED_BIT);
+		relation->pose.orientation = (struct xrt_quat){0, 0, 0, 1};
+	}
+	if (!position_valid) {
+		flags = (enum xrt_space_relation_flags)(flags & ~XRT_SPACE_RELATION_POSITION_TRACKED_BIT);
+		relation->pose.position = (struct xrt_vec3){0};
+	}
+#ifdef XRT_FEATURE_SLAM
+	relation->pose = wmr_hmd_correct_pose_from_basalt(relation->pose);
+#endif
+	if (name == XRT_INPUT_GENERIC_HEAD_POSE && imu2me) {
+		if (orientation_valid) {
+			math_pose_transform(&relation->pose, P_imu_me, &relation->pose);
+		} else if (P_imu_me->position.x != 0 || P_imu_me->position.y != 0 || P_imu_me->position.z != 0) {
+			// Eye translation needs the IMU attitude to rotate its lever arm. Without it, the IMU
+			// position alone cannot truthfully be reported as a valid middle-eye position.
+			flags = (enum xrt_space_relation_flags)(flags & ~(XRT_SPACE_RELATION_POSITION_VALID_BIT |
+			                                                XRT_SPACE_RELATION_POSITION_TRACKED_BIT));
+		}
+	}
+	if (!orientation_valid) { relation->pose.orientation = (struct xrt_quat){0, 0, 0, 1}; }
+	if (!(flags & XRT_SPACE_RELATION_POSITION_VALID_BIT)) { relation->pose.position = (struct xrt_vec3){0}; }
+
+	// The head guard consumes the IMU-reference linear field even when the HEAD LV flag is
+	// suppressed. Preserve this internal field contract; SteamVR still gets no eye velocity.
+	if (name == XRT_INPUT_GENERIC_HEAD_POSE) {
+		flags = (enum xrt_space_relation_flags)(flags & ~XRT_SPACE_RELATION_LINEAR_VELOCITY_VALID_BIT);
+	}
+	if (supplied_linear_velocity) {
+#ifdef XRT_FEATURE_SLAM
+		relation->linear_velocity = wmr_hmd_correct_vec3_from_basalt(relation->linear_velocity);
+#endif
+	} else { relation->linear_velocity = (struct xrt_vec3){0}; }
+	if (flags & XRT_SPACE_RELATION_ANGULAR_VELOCITY_VALID_BIT) {
+#ifdef XRT_FEATURE_SLAM
+		relation->angular_velocity = wmr_hmd_correct_vec3_from_basalt(relation->angular_velocity);
+#endif
+	} else { relation->angular_velocity = (struct xrt_vec3){0}; }
+	relation->relation_flags = flags;
+}
+
 static void
 wmr_hmd_get_slam_tracked_pose(struct xrt_device *xdev,
                               enum xrt_input_name name,
@@ -1162,78 +1317,24 @@ wmr_hmd_get_slam_tracked_pose(struct xrt_device *xdev,
                               struct xrt_space_relation *out_relation)
 {
 	DRV_TRACE_MARKER();
-
 	struct wmr_hmd *wh = wmr_hmd(xdev);
+	*out_relation = (struct xrt_space_relation){0};
+	out_relation->pose.orientation.w = 1;
 	xrt_tracked_slam_get_tracked_pose(wh->tracking.slam, at_timestamp_ns, out_relation);
-
-	int pose_bits = XRT_SPACE_RELATION_ORIENTATION_TRACKED_BIT | XRT_SPACE_RELATION_POSITION_TRACKED_BIT;
-	bool pose_tracked = out_relation->relation_flags & pose_bits;
-
-	// Which velocity data the SLAM prediction actually provided (before the flags are
-	// narrowed to the pose bits below).
-	enum xrt_space_relation_flags slam_flags = out_relation->relation_flags;
-
-	// Compute on a LOCAL pose. wh->pose is shared with concurrent callers of this getter (the
-	// ~1 kHz HEAD_POSE pulls race the controller/constellation/body-anchor TRACKER_POSE reads),
-	// so it must never be used as scratch: the old in-place P_imu_me transform below leaked
-	// middle-eye/torn poses into TRACKER consumers and re-applied the transform onto the stale
-	// member (compounding) while untracked.
-	struct xrt_pose pose;
-	if (pose_tracked) {
+	// Retain the existing debug/3DoF switch seed in IMU coordinates, but never read it as SLAM fallback.
+	if ((out_relation->relation_flags & (XRT_SPACE_RELATION_ORIENTATION_VALID_BIT | XRT_SPACE_RELATION_POSITION_VALID_BIT)) ==
+	    (XRT_SPACE_RELATION_ORIENTATION_VALID_BIT | XRT_SPACE_RELATION_POSITION_VALID_BIT)) {
+		// The SLAM query has returned; do not hold this mutex across t_slam or VIT calls.
+		os_mutex_lock(&wh->fusion.mutex);
 #ifdef XRT_FEATURE_SLAM
-		// !todo Correct pose depending on the VIT system in use, this should be done in the system itself.
-		// For now, assume that we are using Basalt.
-		pose = wmr_hmd_correct_pose_from_basalt(out_relation->pose);
+		wh->pose = wmr_hmd_correct_pose_from_basalt(out_relation->pose);
 #else
-		pose = out_relation->pose;
+		wh->pose = out_relation->pose;
 #endif
-		// Single assignment, always in the IMU frame (never me-transformed): u_var display and
-		// the 3dof/tracker-switch "last tracked pose" seeds.
-		wh->pose = pose;
-	} else {
-		pose = wh->pose;
+		os_mutex_unlock(&wh->fusion.mutex);
 	}
-
-	// Defined velocity-field contract for downstream consumers (the world re-anchor guard's IMU
-	// envelope reads the magnitudes; the dev0 getpose tap records the vectors): each field
-	// carries the SLAM prediction's velocity when it provided one — frame-corrected like the
-	// pose, Basalt frame -> WMR — else exactly zero, never the caller's uninitialized stack
-	// (predict_pose returns flags-only when the relation history is empty).
-	if ((slam_flags & XRT_SPACE_RELATION_LINEAR_VELOCITY_VALID_BIT) != 0) {
-#ifdef XRT_FEATURE_SLAM
-		out_relation->linear_velocity = wmr_hmd_correct_vec3_from_basalt(out_relation->linear_velocity);
-#endif
-	} else {
-		out_relation->linear_velocity = (struct xrt_vec3){0, 0, 0};
-	}
-	if ((slam_flags & XRT_SPACE_RELATION_ANGULAR_VELOCITY_VALID_BIT) != 0) {
-#ifdef XRT_FEATURE_SLAM
-		out_relation->angular_velocity = wmr_hmd_correct_vec3_from_basalt(out_relation->angular_velocity);
-#endif
-	} else {
-		out_relation->angular_velocity = (struct xrt_vec3){0, 0, 0};
-	}
-
-	if (name == XRT_INPUT_GENERIC_HEAD_POSE && wh->tracking.imu2me) {
-		/* Move the pose to the middle-eye position for generic head pose, but not for generic tracker pose */
-		math_pose_transform(&pose, &wh->config.sensors.transforms.P_imu_me, &pose);
-	}
-
-	out_relation->pose = pose;
-	enum xrt_space_relation_flags flags = (enum xrt_space_relation_flags)(
-	    XRT_SPACE_RELATION_ORIENTATION_VALID_BIT | XRT_SPACE_RELATION_POSITION_VALID_BIT |
-	    XRT_SPACE_RELATION_ORIENTATION_TRACKED_BIT | XRT_SPACE_RELATION_POSITION_TRACKED_BIT);
-	if (name == XRT_INPUT_GENERIC_TRACKER_POSE) {
-		// The raw-tracker consumer (constellation vision + its ESKF world re-anchor detector,
-		// t_constellation_tracking.c) gets the honest velocity validity. The presentation
-		// consumer (GENERIC_HEAD_POSE -> the SteamVR seam) keeps pose-only flags: forwarding
-		// head velocities into the runtime's photon-time extrapolation is the L3 decision,
-		// deliberately not taken here.
-		flags = (enum xrt_space_relation_flags)(
-		    flags | (slam_flags & (XRT_SPACE_RELATION_LINEAR_VELOCITY_VALID_BIT |
-		                           XRT_SPACE_RELATION_ANGULAR_VELOCITY_VALID_BIT)));
-	}
-	out_relation->relation_flags = flags;
+	wmr_hmd_correct_slam_relation(name, wh->tracking.imu2me, &wh->config.sensors.transforms.P_imu_me,
+	                              out_relation);
 }
 
 static xrt_result_t
@@ -1263,6 +1364,8 @@ wmr_hmd_get_tracked_pose(struct xrt_device *xdev,
 
 	if (xret == XRT_SUCCESS) {
 		math_pose_transform(&wh->offset, &out_relation->pose, &out_relation->pose);
+		math_quat_rotate_derivative(&wh->offset.orientation, &out_relation->angular_velocity,
+		                            &out_relation->angular_velocity);
 	}
 
 	return xret;
@@ -2308,16 +2411,70 @@ wmr_hmd_send_controller_packet(struct wmr_hmd *hmd, const uint8_t *buffer, uint3
 	return ret != -1 && (uint32_t)(ret) == buf_size;
 }
 
-/* Called from WMR controller implementation only during fw reads. @todo: Refactor
- * controller firmware reads to happen from a state machine and not require this blocking method */
+/* Called on the HMD reader thread during controller creation. The same HID endpoint carries
+ * head IMU and both controllers. Preserve unrelated reports instead of treating them as firmware
+ * replies. No callback runs with hid_lock held; lifecycle reports wait for the outer dispatcher. */
 int
-wmr_hmd_read_sync_from_controller(struct wmr_hmd *hmd, uint8_t *buffer, uint32_t buf_size, int timeout_ms)
+wmr_hmd_read_sync_from_controller(struct wmr_hmd *hmd,
+                                  uint8_t hmd_cmd_base,
+                                  uint8_t *buffer,
+                                  uint32_t buf_size,
+                                  int timeout_ms)
 {
-	os_mutex_lock(&hmd->hid_lock);
-	int res = os_hid_read(hmd->hid_hololens_sensors_dev, buffer, buf_size, timeout_ms);
-	os_mutex_unlock(&hmd->hid_lock);
+	if (hmd->pending_report_count >= WMR_PENDING_REPORT_CAPACITY) {
+		WMR_ERROR(hmd, "Deferred HID report queue is full; aborting controller initialization");
+		return -1;
+	}
+	const int64_t deadline_ns = os_monotonic_get_ns() + (int64_t)timeout_ms * U_TIME_1MS_IN_NS;
+	bool first_read = true;
+	while (first_read || os_monotonic_get_ns() < deadline_ns) {
+		int64_t remaining_ns = deadline_ns - os_monotonic_get_ns();
+		int remaining_ms = remaining_ns > 0 ?
+		    (int)((remaining_ns + U_TIME_1MS_IN_NS - 1) / U_TIME_1MS_IN_NS) : 0;
+		first_read = false;
 
-	return res;
+		// Firmware buffers are only78 bytes; reading into one truncates full381/497-byte IMU reports.
+		uint8_t report[WMR_FEATURE_BUFFER_SIZE];
+		os_mutex_lock(&hmd->hid_lock);
+		int size = os_hid_read(hmd->hid_hololens_sensors_dev, report, sizeof(report), remaining_ms);
+		os_mutex_unlock(&hmd->hid_lock);
+		uint64_t received_ns = os_monotonic_get_ns();
+		if (size <= 0) {
+			return size;
+		}
+
+		// Controller firmware responses use local IDs0x02/0x06, offset by their HMD channel.
+		// Input reports use local ID0x01 and must never satisfy a firmware read.
+		if (report[0] == (uint8_t)(hmd_cmd_base + 0x02) ||
+		    report[0] == (uint8_t)(hmd_cmd_base + 0x06)) {
+			if ((uint32_t)size > buf_size) {
+				WMR_WARN(hmd, "Controller firmware response exceeds caller buffer (%d > %u)", size, buf_size);
+				return -1;
+			}
+			memcpy(buffer, report, (size_t)size);
+			return size;
+		}
+
+		bool published_controller = report[0] != (uint8_t)(hmd_cmd_base + 0x01) &&
+		    ((report[0] == WMR_MS_HOLOLENS_MSG_LEFT_CONTROLLER && hmd->controller[0] != NULL) ||
+		     (report[0] == WMR_MS_HOLOLENS_MSG_RIGHT_CONTROLLER && hmd->controller[1] != NULL));
+		if (report[0] == WMR_MS_HOLOLENS_MSG_SENSORS || published_controller) {
+			// Only an already-published OTHER controller can run here. The explicit channel
+			// exclusion also prevents re-entry if firmware access is later used after creation.
+			hololens_dispatch_packet(hmd, report, size, received_ns);
+		} else {
+			if (!hololens_defer_packet(hmd, report, size, received_ns)) {
+				WMR_ERROR(hmd, "Could not preserve unrelated HID report; aborting controller initialization");
+				return -1;
+			}
+			if (hmd->pending_report_count == WMR_PENDING_REPORT_CAPACITY) {
+				// The last report is preserved. Stop before consuming one that would not fit.
+				WMR_ERROR(hmd, "Deferred HID report queue reached capacity; aborting controller initialization");
+				return -1;
+			}
+		}
+	}
+	return 0;
 }
 
 struct t_constellation_tracked_device_connection *

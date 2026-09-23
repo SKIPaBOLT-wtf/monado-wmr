@@ -91,6 +91,14 @@ t_vit_bundle_load(struct t_vit_bundle *vit, const char *path)
 	GET_PROC(pose_get_timing);
 	GET_PROC(pose_get_features);
 #undef GET_PROC
+	// An absent vendor extension is normal. Clear dlerror before and after lookup
+	// so the optional probe cannot poison a later required-symbol lookup.
+	dlerror();
+	void *bias_proc = dlsym(vit->handle, "vit_g2_pose_get_imu_bias_v1");
+	vit->g2_pose_get_imu_bias_v1 = NULL;
+	if (dlerror() == NULL) {
+		*(void **)&vit->g2_pose_get_imu_bias_v1 = bias_proc;
+	}
 
 	return true;
 }

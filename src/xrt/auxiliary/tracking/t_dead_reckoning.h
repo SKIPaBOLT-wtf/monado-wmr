@@ -43,6 +43,22 @@ t_apply_dead_reckoning(struct m_ff_vec3_f32 *gyro_ff,
                        timepoint_ns base_rel_ts,
                        struct xrt_space_relation *out_relation);
 
+/*!
+ * As above, subtract an optional pose-coupled learned gyroscope bias from each
+ * already statically calibrated BODY/IMU sample before integration. The bias
+ * must belong to base_rel at base_rel_ts. NULL preserves the legacy behavior.
+ * Does not modify either FIFO. Accelerometer calibration and bias are unchanged.
+ */
+void
+t_apply_dead_reckoning_with_gyro_bias(struct m_ff_vec3_f32 *gyro_ff,
+                                    struct m_ff_vec3_f32 *accel_ff,
+                                    const struct xrt_vec3 *gravity_correction,
+                                    const struct xrt_vec3 *gyro_bias,
+                                    timepoint_ns when_ns,
+                                    const struct xrt_space_relation *base_rel,
+                                    timepoint_ns base_rel_ts,
+                                    struct xrt_space_relation *out_relation);
+
 #ifdef __cplusplus
 }
 #endif

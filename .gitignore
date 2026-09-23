@@ -119,3 +119,11 @@ result/
 
 # Kotlin
 .kotlin
+
+# Local diagnostics and device-private data
+__pycache__/
+*.py[cod]
+/private/
+/captures/
+/local-config/
+/artifacts-private/

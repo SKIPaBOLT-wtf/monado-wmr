@@ -166,6 +166,37 @@ u_world_reanchor_apply(const struct u_world_reanchor *wr, const struct xrt_pose 
 void
 u_world_reanchor_get_magnitude(const struct u_world_reanchor *wr, double *out_ang_deg, double *out_pos_m);
 
+/* A controller presentation correction paired with its raw filter snapshot. dp is the
+ * displacement at pivot, not the translation part of the rigid transform. */
+struct u_world_reanchor_compensation
+{
+    double dq[4];
+    double dp[3];
+    double pivot[3];
+    int64_t anchor_ns;
+    double angular_cap_dps;
+    double linear_cap_mps;
+    uint64_t generation;
+    bool active;
+};
+
+void
+u_world_reanchor_compensation_init(struct u_world_reanchor_compensation *state);
+
+/* Pure absolute-time evaluation: never advances mutable state on a pose pull. */
+void
+u_world_reanchor_compensation_evaluate(const struct u_world_reanchor_compensation *state,
+                                      int64_t when_ns, struct xrt_pose *out_from_raw);
+
+/* One exact raw-world rebase, right-composed inversely into the current presentation
+ * correction. The same publication timestamp, pivot and rates go to both controllers.
+ * Returns false for nonfinite/invalid or stale events; callers must then not rebase raw state. */
+bool
+u_world_reanchor_compensation_rebase(struct u_world_reanchor_compensation *state,
+                                    const struct xrt_pose *raw_delta,
+                                    const struct xrt_vec3 *new_raw_pivot,
+                                    int64_t publication_ns, double gyro_dps, double speed_mps);
+
 #ifdef __cplusplus
 }
 #endif

@@ -53,6 +53,7 @@
 #include "util/u_logging.h"
 #include "util/u_misc.h"
 #include "util/u_var.h"
+#include "util/u_world_reanchor.h"
 
 #include <Eigen/Core>
 #include <Eigen/Eigenvalues>
@@ -148,6 +149,9 @@ namespace {
 	constexpr double OOV_HOLD_DRIFT_FLOOR_M_S = 0.15;
 	constexpr double OOV_INERTIAL_VEL_ERR_M_S = 0.15;  //!< realistic velocity-error floor at loss
 	constexpr double OOV_INERTIAL_DRIFT_M_S2 = 1.0;    //!< conservative accel-bias drift during coast
+
+	//! Shared per-LED reprojection measurement noise (px std), fold and frozen-prior projection.
+	constexpr double LED_PIXEL_STD = 1.5;
 
 	//! Precomputed per-view geometry+intrinsics for the per-LED reprojection (built once per frame).
 	struct LedViewCache
@@ -486,6 +490,7 @@ namespace {
 	//! order (x, y, z, w).
 	struct FilterSnapshot
 	{
+		u_world_reanchor_compensation presentation;
 		double position[3];
 		double orientation[4];
 		double linear_velocity[3];
@@ -507,6 +512,7 @@ namespace {
 		timepoint_ns last_optical_ns;
 		timepoint_ns optical_velocity_ns;
 		bool tracked;
+		bool confirmed_idle;
 		bool position_valid;
 		bool position_tracked;
 		bool orientation_valid;
@@ -550,6 +556,9 @@ namespace {
 		TrackingInfo position_state;
 		int imu_anomaly_count{0};
 		bool tracked{false};
+		bool confirmed_idle{false};
+		timepoint_ns idle_start_ns{0};
+		timepoint_ns idle_end_ns{0};
 		bool body_lock_valid{false};
 		bool body_anchored{false};
 		bool optical_velocity_valid{false};
@@ -561,6 +570,8 @@ namespace {
 		double accel_scale{1.0};
 		bool scale_bootstrapped{false};
 		Quaterniond gravity_corrected_q{1.0, 0.0, 0.0, 0.0};
+		double gravity_excess_m_s2{1e9};
+		bool gravity_valid{false};
 		//! Orientation-adoption veto reference: an OOSM rewind-replay must re-decide the veto against the
 		//! same dead-reckoned attitude it saw in-order, or a lagged pose folds against a stale reference.
 		Quaterniond gyro_ref_q{Quaterniond::Identity()};
@@ -573,6 +584,7 @@ namespace {
 	struct ImuLogEntry
 	{
 		xrt_imu_sample sample;
+		bool idle_status{false}; //!< timestamp-only hardware status, never a fabricated IMU sample
 	};
 
 	//! Raw extrapolation of the published snapshot to a render time — the filter's honest belief, with NO
@@ -612,6 +624,9 @@ namespace {
 		clear_position_tracked_flag() override;
 
 		void
+		process_idle_status(timepoint_ns timestamp_ns) override;
+
+		void
 		process_imu_data(const struct xrt_imu_sample *sample,
 		                 const struct xrt_vec3 *accel_variance_optional,
 		                 const struct xrt_vec3 *gyro_variance_optional) override;
@@ -645,7 +660,19 @@ namespace {
 		void
 		get_prediction(const timepoint_ns when_ns,
 		               struct xrt_space_relation *out_relation,
-		               const struct xrt_pose *hmd_world_pose) override;
+		               const struct xrt_pose *hmd_world_pose,
+		               struct xrt_pose *out_from_raw = nullptr,
+		               uint64_t *out_generation = nullptr,
+		               bool hmd_pose_is_presented = false) override;
+
+		bool
+		get_estimator_prior(timepoint_ns when_ns, t_estimator_prior *out) override;
+		uint64_t
+		get_world_generation() override
+		{
+			std::lock_guard<std::mutex> lock(m_filter_lock);
+			return m_world_generation;
+		}
 
 		void
 		get_predicted_pose(const timepoint_ns when_ns, struct xrt_space_relation *out_relation) override;
@@ -826,7 +853,7 @@ namespace {
 		update_body_anchor(const struct xrt_pose *hmd_pose) override
 		{
 			std::lock_guard<std::mutex> lock(m_filter_lock);
-			if (fold_body_anchor(hmd_pose)) {
+			if (!m_confirmed_idle && fold_body_anchor(hmd_pose)) {
 				publish_snapshot();
 			}
 		}
@@ -836,15 +863,28 @@ namespace {
 		void
 		re_anchor_world(const struct xrt_pose *delta) override
 		{
+			re_anchor_world_with_presentation(delta, nullptr, 0, 0.0, 0.0);
+		}
+
+		void
+		re_anchor_world_with_presentation(const struct xrt_pose *delta, const struct xrt_vec3 *new_raw_pivot,
+		                                  timepoint_ns publication_ns, double gyro_dps, double speed_mps) override
+		{
 			if (delta == nullptr) {
 				return;
 			}
+			std::lock_guard<std::mutex> report_lock(m_world_report_lock);
 			const Quaterniond R = Quaterniond{delta->orientation.w, delta->orientation.x,
 			                                  delta->orientation.y, delta->orientation.z}
 			                          .normalized();
 			const Vector3d t{delta->position.x, delta->position.y, delta->position.z};
 			{
 				std::lock_guard<std::mutex> lock(m_filter_lock);
+				// The pose and inverse of this exact raw transition publish in one snapshot.
+				if (publication_ns != 0 && !u_world_reanchor_compensation_rebase(
+				        &m_presentation, delta, new_raw_pivot, publication_ns, gyro_dps, speed_mps)) {
+					return;
+				}
 				apply_world_delta(R, t);
 				publish_snapshot();
 			}
@@ -990,8 +1030,7 @@ namespace {
 		//! filter stays responsive when IMU propagation is absent.
 		static constexpr double PROC_ACCEL_CV = 10.0;  //!< unmodeled linear accel (m/s^2)
 		static constexpr double PROC_GYRO_CV = 5.0;    //!< unmodeled angular rate (rad/s)
-		//! Per-LED reprojection measurement noise (px std) -> R diagonal = LED_PIXEL_STD^2.
-		static constexpr double LED_PIXEL_STD = 1.5;
+
 		static constexpr double PER_LED_R_INFLATE_MAX_X = 4.0;
 		//! Per-LED robustness as two confidence levels (the real knobs); the chi-square thresholds are
 		//! DERIVED from them via chi2inv_2dof. GATE = acceptance confidence (covariance-aware via S_i, so
@@ -1178,11 +1217,22 @@ namespace {
 		double m_gravity_excess_m_s2{1e9};
 		bool m_gravity_valid{false};
 
+		u_world_reanchor_compensation m_presentation{{0.0, 0.0, 0.0, 1.0}};
 		timepoint_ns filter_time_ns{0};
 		//! Timestamp of the last IMU sample that actually propagated. Lets propagate_to tell a tiny
 		//! post-IMU sub-sample gap (use small IMU noise) from genuine pose-only operation (use the larger
 		//! constant-velocity process noise) — otherwise the CV noise would jitter velocity on every fold.
 		timepoint_ns m_last_imu_ns{0};
+		bool m_confirmed_idle{false};
+		timepoint_ns m_idle_start_ns{0};
+		timepoint_ns m_idle_end_ns{0};
+
+		bool
+		optical_during_idle(timepoint_ns timestamp_ns) const
+		{
+			return m_idle_start_ns != 0 && timestamp_ns >= m_idle_start_ns &&
+			       (m_idle_end_ns == 0 || timestamp_ns < m_idle_end_ns);
+		}
 		bool tracked{false};
 		TrackingInfo orientation_state;
 		TrackingInfo position_state;
@@ -1198,7 +1248,7 @@ namespace {
 		//! optical attitude, propagated forward by the body gyro in integrate_imu_sample and NEVER moved by
 		//! folds / re-anchor floods / speculative feeds -> a covariance-independent short-horizon attitude
 		//! truth. m_gyro_ref_rot accumulates the integrated |w| dt (rad) since the snapshot (the envelope's
-		//! rotation scale). Snapshotted on adoption (reject_orientation_flip), held through vetoes.
+		//! rotation scale). Snapshotted on committed adoption, held through vetoes.
 		Quaterniond m_gyro_ref_q{Quaterniond::Identity()};
 		timepoint_ns m_gyro_ref_ns{0};
 		double m_gyro_ref_rot{0.0};
@@ -1241,6 +1291,7 @@ namespace {
 		//! cross-frame state the render path read-modify-writes, which the publish-only seqlock can't model. A
 		//! dedicated LEAF mutex guards it: get_prediction takes it after read_snapshot returns its copy and never
 		//! while m_filter_lock is held, so it can't nest with either lock. Taken only during an active blend (rare).
+		std::mutex m_world_report_lock; //!< pairs world rebases with snapshot+render-state reads
 		std::mutex m_reentry_render_lock;
 		timepoint_ns m_reentry_render_epoch_ns{0}; //!< which blend (its start time) m_reentry_cur_pos belongs to
 		timepoint_ns m_reentry_last_render_ns{0};
@@ -1321,6 +1372,11 @@ namespace {
 		FilterCheckpoint m_anchor;
 		bool m_anchor_valid{false};
 		std::deque<ImuLogEntry> m_imu_log;
+		//! Capture-time estimates, populated only by actual integration/replay. Readers never run folds.
+		std::deque<FilterCheckpoint> m_estimator_history;
+		uint64_t m_world_generation{0}; //!< raw coordinate system; estimator reset does not change it
+		bool m_history_reset_pending{false}; //!< committed at the next history record, after optical rollback
+
 
 		//! Serialises the two writer threads (IMU ~200 Hz, optical ~60 Hz). get_prediction never takes
 		//! it — that path is wait-free via the seqlock.
@@ -1354,23 +1410,26 @@ namespace {
 		//! orientation, so a re-anchor flood or speculative feed cannot neutralise the veto. Vetoed only while
 		//! the reference is fresh (< FLIP_GUARD_TRUST_NS) AND cand exceeds the measured gyro envelope AND that
 		//! disagreement has not been sustained past FLIP_LOCKIN_RELEASE_NS (a sustained disagreement means the
-		//! reference, not optical, is the outlier -> adopt/re-seed, breaking a wrong-attitude lock-in). On
-		//! ADOPTION the candidate becomes the new reference (snapshot_gyro_ref). Caller holds m_filter_lock.
+		//! reference, not optical, is the outlier -> allow adoption, breaking a wrong-attitude lock-in).
+		//! This decision may start a dissent episode but never adopts a reference. Caller commits only after
+		//! a successful orientation-bearing update. Caller holds m_filter_lock.
 		bool
 		reject_orientation_flip(const Quaterniond &cand, timepoint_ns when_ns);
 		//! Pure geometric flip test (no side effects): is @p cand outside the fresh gyro envelope, i.e. a
-		//! likely mirror-flip? The shared core of reject_orientation_flip (which adds the lock-in release +
-		//! reference snapshot) and the re-anchor cache pre-filter. Caller holds m_filter_lock.
+		//! likely mirror-flip? The shared core of reject_orientation_flip (which adds the lock-in release)
+		//! and the re-anchor cache pre-filter. Caller holds m_filter_lock.
 		bool
 		orientation_flip_vs_gyro(const Quaterniond &cand, timepoint_ns when_ns) const;
 		//! Snapshot @p cand as the gyro dead-reckoning reference: the veto's short-horizon attitude truth,
 		//! re-integrated forward by the body gyro until the next adoption. Caller holds m_filter_lock.
 		void
 		snapshot_gyro_ref(const Quaterniond &cand, timepoint_ns when_ns);
-		//! Gyro arbitration helper: return @p cand unless reject_orientation_flip vetoes it, in which case
-		//! return the current gyro orientation so a flip cannot be adopted. Caller holds m_filter_lock.
-		Quaterniond
-		flip_guard(const Quaterniond &cand);
+		//! Commit an actually adopted optical orientation as the gyro reference and restart its agree clock.
+		void
+		commit_orientation_reference(const Quaterniond &cand, timepoint_ns when_ns);
+		//! Re-anchor position, adopting and committing candidate orientation only if gyro arbitration allows.
+		void
+		reanchor_with_gyro_guard(const Vector3d &pos, const Quaterniond &cand);
 		//! Fold an accel gravity-direction measurement (anchors roll+pitch) when the bias-corrected
 		//! body accel magnitude is within GRAV_BAND of g, i.e. linear acceleration is small enough that
 		//! the accel direction is the gravity direction. No-op otherwise. Caller holds m_filter_lock.
@@ -1565,11 +1624,19 @@ namespace {
 		//! rather than discarded — its inertial information is real and a power-limited link cannot spare it.
 		//! Caller holds m_filter_lock.
 		void
-		integrate_late_imu_sample(const xrt_imu_sample &sample);
+		integrate_late_imu_sample(const xrt_imu_sample &sample, bool idle_status = false);
+		bool
+		integrate_input_event(const ImuLogEntry &event);
+		void
+		process_input_event(const ImuLogEntry &event);
 		FilterCheckpoint
 		capture_checkpoint() const;
 		void
 		restore_checkpoint(const FilterCheckpoint &c);
+		void
+		record_estimator_history();
+		void
+		rewind_estimator_history(timepoint_ns when_ns);
 		void
 		publish_snapshot();
 		FilterSnapshot
@@ -1616,6 +1683,7 @@ namespace {
 	void
 	EskfFusion::reset_filter()
 	{
+		m_history_reset_pending = true;
 		m_x = NominalState{};
 		m_P.setZero();
 		m_P.block<3, 3>(EP, EP) = Mat3::Identity() * P0_POS;
@@ -1629,6 +1697,8 @@ namespace {
 		m_gravity_excess_m_s2 = 1e9;
 		m_gravity_valid = false;
 		tracked = false;
+		m_confirmed_idle = false;
+		m_idle_start_ns = m_idle_end_ns = 0;
 		position_state = TrackingInfo{};
 		m_body_lock_valid = false; // a lost track invalidates the head-relative offset; re-captured on re-lock
 		// A reset wipes the orientation basin (m_x.q -> identity); there is no longer a gyro reference
@@ -1689,6 +1759,7 @@ namespace {
 		m_optical_velocity_world.setZero();
 		m_optical_velocity_ns = 0;
 		m_optical_velocity_valid = false;
+		commit_orientation_reference(m_x.q, filter_time_ns);
 		seed_optical_position_history(m_x.p, Vector3d::Constant(P0_POS));
 		capture_body_lock();
 	}
@@ -1758,8 +1829,7 @@ namespace {
 			map_quat(m_pnp_pose.orientation) = pq.cast<float>();
 		}
 
-		if (m_anchor_valid) {
-			FilterCheckpoint &c = m_anchor;
+		const auto transform_checkpoint = [&](FilterCheckpoint &c) {
 			xform_point(c.nominal.p);
 			rot_vec(c.nominal.v);
 			rot_quat(c.nominal.q);
@@ -1776,7 +1846,10 @@ namespace {
 			if (c.gyro_ref_valid) {
 				rot_quat(c.gyro_ref_q);
 			}
-		}
+		};
+		if (m_anchor_valid) { transform_checkpoint(m_anchor); }
+		for (auto &c : m_estimator_history) { transform_checkpoint(c); }
+		++m_world_generation;
 	}
 
 	Vector3d
@@ -1816,9 +1889,7 @@ namespace {
 	EskfFusion::reject_orientation_flip(const Quaterniond &cand, timepoint_ns when_ns)
 	{
 		if (!orientation_flip_vs_gyro(cand, when_ns)) {
-			m_last_orient_agree_ns = when_ns; // optical confirms the gyro (or re-seeds it) -> restart the clock
-			snapshot_gyro_ref(cand, when_ns); // adopted: the candidate becomes the new reference
-			return false;
+			return false; // eligible; only a successful orientation update may commit the reference
 		}
 		// Disagreement past the gyro envelope while the reference is fresh: a mirror-flip OR the reference
 		// has locked into a wrong basin while its own (correct) optical keeps arriving. Distinguish by HOW
@@ -1839,23 +1910,26 @@ namespace {
 		if ((when_ns - m_last_orient_agree_ns) < FLIP_LOCKIN_RELEASE_NS) {
 			return true; // veto until sustained (position-only, keep gyro orientation, reference held)
 		}
-		// Sustained dissent: the reference, not optical, was the outlier -> adopt/re-seed. INVARIANT:
-		// every adoption restarts the agree clock — adoption re-defines the basin, so the dissent run
-		// has ended by fiat. Without this, the clock stays >= FLIP_LOCKIN_RELEASE_NS old and the very
-		// next candidate disagreeing with the just-adopted basin is adopted too: alternating mirror
-		// twins ping-pong with ZERO vetoes until two consecutive frames agree. The fast path was
-		// accidentally repaired by its double call (the second call agreed with the re-seeded
-		// reference), but the OOSM rewind path replays with the stale clock checkpointed into the
-		// anchor — this restart makes the invariant explicit on both paths.
-		m_last_orient_agree_ns = when_ns;
-		snapshot_gyro_ref(cand, when_ns);
+		// Sustained dissent permits adoption, but must not change the reference if a later gate or
+		// update rejects this measurement. Committing the accepted orientation restarts the clock.
 		return false;
 	}
 
-	Quaterniond
-	EskfFusion::flip_guard(const Quaterniond &cand)
+	void
+	EskfFusion::commit_orientation_reference(const Quaterniond &cand, timepoint_ns when_ns)
 	{
-		return reject_orientation_flip(cand, filter_time_ns) ? m_x.q : cand;
+		m_last_orient_agree_ns = when_ns;
+		snapshot_gyro_ref(cand, when_ns);
+	}
+
+	void
+	EskfFusion::reanchor_with_gyro_guard(const Vector3d &pos, const Quaterniond &cand)
+	{
+		const bool rejected = reject_orientation_flip(cand, filter_time_ns);
+		reanchor(pos, rejected ? m_x.q : cand);
+		if (!rejected) {
+			commit_orientation_reference(cand, filter_time_ns);
+		}
 	}
 
 	void
@@ -1956,6 +2030,9 @@ namespace {
 		c.body_offset_world = m_body_offset_world;
 		c.filter_time_ns = filter_time_ns;
 		c.last_imu_ns = m_last_imu_ns;
+		c.confirmed_idle = m_confirmed_idle;
+		c.idle_start_ns = m_idle_start_ns;
+		c.idle_end_ns = m_idle_end_ns;
 		c.last_optical_ns = last_optical_ns;
 		c.last_orient_agree_ns = m_last_orient_agree_ns;
 		c.last_led_fold_ns = m_last_led_fold_ns;
@@ -1975,6 +2052,8 @@ namespace {
 		c.accel_scale = m_accel_scale;
 		c.scale_bootstrapped = m_scale_bootstrapped;
 		c.gravity_corrected_q = m_gravity_corrected_q;
+		c.gravity_excess_m_s2 = m_gravity_excess_m_s2;
+		c.gravity_valid = m_gravity_valid;
 		c.gyro_ref_q = m_gyro_ref_q;
 		c.gyro_ref_ns = m_gyro_ref_ns;
 		c.gyro_ref_rot = m_gyro_ref_rot;
@@ -1999,6 +2078,9 @@ namespace {
 		m_body_offset_world = c.body_offset_world;
 		filter_time_ns = c.filter_time_ns;
 		m_last_imu_ns = c.last_imu_ns;
+		m_confirmed_idle = c.confirmed_idle;
+		m_idle_start_ns = c.idle_start_ns;
+		m_idle_end_ns = c.idle_end_ns;
 		last_optical_ns = c.last_optical_ns;
 		m_last_orient_agree_ns = c.last_orient_agree_ns;
 		m_last_led_fold_ns = c.last_led_fold_ns;
@@ -2018,6 +2100,8 @@ namespace {
 		m_accel_scale = c.accel_scale;
 		m_scale_bootstrapped = c.scale_bootstrapped;
 		m_gravity_corrected_q = c.gravity_corrected_q;
+		m_gravity_excess_m_s2 = c.gravity_excess_m_s2;
+		m_gravity_valid = c.gravity_valid;
 		m_gyro_ref_q = c.gyro_ref_q;
 		m_gyro_ref_ns = c.gyro_ref_ns;
 		m_gyro_ref_rot = c.gyro_ref_rot;
@@ -2025,9 +2109,35 @@ namespace {
 	}
 
 	void
+	EskfFusion::record_estimator_history()
+	{
+		if (m_history_reset_pending) {
+			m_estimator_history.clear();
+			m_history_reset_pending = false;
+		}
+		if (!tracked || filter_time_ns == 0) { return; }
+		while (!m_estimator_history.empty() && m_estimator_history.back().filter_time_ns >= filter_time_ns) {
+			m_estimator_history.pop_back();
+		}
+		m_estimator_history.push_back(capture_checkpoint());
+		while (m_estimator_history.size() > 512) { m_estimator_history.pop_front(); }
+	}
+
+	void
+	EskfFusion::rewind_estimator_history(timepoint_ns when_ns)
+	{
+		while (!m_estimator_history.empty() && m_estimator_history.back().filter_time_ns >= when_ns) {
+			m_estimator_history.pop_back();
+		}
+		record_estimator_history();
+	}
+
+	void
 	EskfFusion::publish_snapshot()
 	{
+		record_estimator_history();
 		FilterSnapshot s;
+		s.presentation = m_presentation;
 		Eigen::Map<Vector3d>{s.position} = m_x.p;
 		Eigen::Map<Quaterniond>{s.orientation} = m_x.q;
 		Eigen::Map<Vector3d>{s.linear_velocity} = m_x.v;
@@ -2083,6 +2193,7 @@ namespace {
 		s.last_optical_ns = last_optical_ns;
 		s.optical_velocity_ns = m_optical_velocity_ns;
 		s.tracked = tracked;
+		s.confirmed_idle = m_confirmed_idle;
 		s.position_valid = position_state.valid;
 		s.position_tracked = position_state.tracked;
 		s.orientation_valid = orientation_state.valid;
@@ -2138,6 +2249,9 @@ namespace {
 		double dt = time_ns_to_s(target_ns - filter_time_ns);
 		const bool post_imu = (m_last_imu_ns != 0 && filter_time_ns == m_last_imu_ns);
 		filter_time_ns = target_ns;
+		if (m_confirmed_idle) {
+			return; // hardware-confirmed stationary hold: no unobserved-motion process growth
+		}
 		if (dt > 0.2) {
 			dt = 0.2;
 		}
@@ -2165,6 +2279,37 @@ namespace {
 	}
 
 	bool
+	EskfFusion::integrate_input_event(const ImuLogEntry &event)
+	{
+		if (!event.idle_status) {
+			return integrate_imu_sample(event.sample);
+		}
+		const timepoint_ns timestamp_ns = event.sample.timestamp_ns;
+		if (!m_confirmed_idle) {
+			const bool recent_rest = m_last_imu_ns != 0 && timestamp_ns >= m_last_imu_ns &&
+			    timestamp_ns - m_last_imu_ns <= ms_to_ns(250) && m_rest_count >= ZUPT_MIN_REST &&
+			    m_x.v.norm() <= ZUPT_MAX_SPEED_M_S;
+			if (!recent_rest) {
+				return true; // a status packet alone cannot establish stationarity
+			}
+			m_confirmed_idle = true;
+			m_idle_start_ns = timestamp_ns;
+			m_idle_end_ns = 0;
+			m_x.v.setZero();
+			m_accel_world.setZero();
+			m_angvel_world.setZero();
+			m_optical_velocity_world.setZero();
+			m_optical_velocity_valid = false;
+			m_pnp_valid = false;
+			m_reentry_active = false;
+			m_body_anchored = false;
+		}
+		// Advance only the input clock. Optical anchors and the last REAL IMU timestamp are untouched.
+		propagate_to(timestamp_ns);
+		return true;
+	}
+
+	bool
 	EskfFusion::integrate_imu_sample(const xrt_imu_sample &sample)
 	{
 		const Vector3d G = Vector3d::UnitY() * -MATH_GRAVITY_M_S2;
@@ -2178,6 +2323,7 @@ namespace {
 		const bool accel_outlier =
 		    !a_m.allFinite() || a_m.squaredNorm() > MAX_ACCEL_M_S2 * MAX_ACCEL_M_S2;
 		if (gyro_outlier || accel_outlier) {
+			m_rest_count = 0;
 			if (++m_imu_anomaly_count >= IMU_ANOMALY_RESET_RUN) {
 				U_LOG_E("Sustained anomalous IMU samples (%d) - resetting filter", m_imu_anomaly_count);
 				reset_filter_and_imu();
@@ -2190,9 +2336,23 @@ namespace {
 		}
 		m_imu_anomaly_count = 0;
 
-		double dt = time_ns_to_s(sample.timestamp_ns - filter_time_ns);
+		const bool waking_from_idle = m_confirmed_idle && sample.timestamp_ns >= m_idle_start_ns;
+		if (waking_from_idle) {
+			m_confirmed_idle = false;
+			m_idle_end_ns = sample.timestamp_ns;
+			m_pnp_valid = false; // no idle optical candidate may become a wake-up snap target
+			snapshot_gyro_ref(m_x.q, sample.timestamp_ns);
+		}
+		if (m_last_imu_ns != 0 && sample.timestamp_ns - m_last_imu_ns > ms_to_ns(50)) {
+			m_rest_count = 0; // a rest run requires consecutive recent real sensor samples
+		}
+
+		// The first live sample ends the stationary interval at its own timestamp. Its rate is
+		// available for prediction immediately, but cannot describe any part of the preceding sleep.
+		// In particular, delayed idle cameras/statuses must not choose its integration interval.
+		double dt = waking_from_idle ? 0.0 : time_ns_to_s(sample.timestamp_ns - filter_time_ns);
 		filter_time_ns = sample.timestamp_ns;
-		if (dt <= 0.0) {
+		if (dt <= 0.0 && !waking_from_idle) {
 			return true; // duplicate/again-stamped sample; clock already covers it
 		}
 		m_last_imu_ns = sample.timestamp_ns; // a real IMU propagation just happened (post_imu marker)
@@ -2259,6 +2419,11 @@ namespace {
 		const Mat3 T_a = m_accel_T_valid ? m_accel_T : (m_accel_scale * Mat3::Identity());
 		const Vector3d f = T_a * (a_m - m_x.ba);
 		const Vector3d a_world = R * f + G;    // world acceleration (incl. gravity)
+		if (waking_from_idle) {
+			m_accel_world = a_world;
+			m_angvel_world = R * w;
+			return true;
+		}
 
 		// --- error-state covariance propagation (global angular error) ---
 		Mat15 F = Mat15::Zero();
@@ -2555,7 +2720,7 @@ namespace {
 
 		// Iterated EKF (Gauss-Newton): keep the PRIOR (x0, P0) fixed and refine the estimate. Each step
 		// relinearizes H at the current iterate and re-solves a P0-weighted GN move FROM the prior:
-		//   e_{i+1} = K_i ( z - h(x_i) - H_i e_i ),   K_i = P0 H_i^T (H_i P0 H_i^T + R)^-1
+		//   e_{i+1} = K_i ( z - h(x_i) + H_i e_i ),   K_i = P0 H_i^T (H_i P0 H_i^T + R)^-1
 		// where e_i is the error-state from x0 to the current iterate x_i. Anchored to the prior, the
 		// iteration descends within the prior's basin (it cannot cross to a flipped twin — that is what
 		// keeps the gyro flip-veto sound). A first step with negligible innovation is the ordinary EKF.
@@ -2626,7 +2791,7 @@ namespace {
 				prior_nis_ok = true;
 			}
 			const MatX Ki = PHt * Sinv;                   // 15 x 2k
-			Vec15 e_new = Ki * (r - H * e);               // GN step from the prior
+			Vec15 e_new = Ki * (r + H * e);               // GN step from the prior
 			if (!e_new.allFinite()) {
 				break;
 			}
@@ -2684,7 +2849,7 @@ namespace {
 			m_P = position_recovery ? P_pre_gate : P0;
 			const Vector3d pnp_pos = map_vec3(m_pnp_pose.position).cast<double>();
 			if (m_pnp_valid && pnp_pos.allFinite() && position_plausible(pnp_pos)) {
-				reanchor(pnp_pos, flip_guard(map_quat(m_pnp_pose.orientation).cast<double>()));
+				reanchor_with_gyro_guard(pnp_pos, map_quat(m_pnp_pose.orientation).cast<double>());
 			} else {
 				reset_filter();
 			}
@@ -2699,7 +2864,7 @@ namespace {
 			m_P = position_recovery ? P_pre_gate : P0;
 			const Vector3d pnp_pos = map_vec3(m_pnp_pose.position).cast<double>();
 			if (m_pnp_valid && pnp_pos.allFinite() && position_plausible(pnp_pos)) {
-				reanchor(pnp_pos, flip_guard(map_quat(m_pnp_pose.orientation).cast<double>()));
+				reanchor_with_gyro_guard(pnp_pos, map_quat(m_pnp_pose.orientation).cast<double>());
 			} else {
 				reset_filter();
 			}
@@ -2764,54 +2929,39 @@ namespace {
 	}
 
 	bool
-	EskfFusion::predict_led_gate(const timepoint_ns when_ns,
-	                             const LEDObservation &o,
-	                             const LEDCameraView &view,
-	                             float out_zhat[2],
-	                             float out_S[4])
+	project_prior_led_gate(const t_estimator_prior &prior,
+	                            const LEDObservation &o,
+	                            const LEDCameraView &view,
+	                            float out_zhat[2], float out_S[4])
 	{
-		std::lock_guard<std::mutex> lock(m_filter_lock);
-		if (!tracked) {
-			return false;
-		}
-		FilterSnapshot snap = {};
-		Eigen::Map<Vector3d>{snap.position} = m_x.p;
-		Eigen::Map<Quaterniond>{snap.orientation} = m_x.q;
-		Eigen::Map<Vector3d>{snap.linear_velocity} = m_x.v;
-		Eigen::Map<Vector3d>{snap.angular_velocity} = m_angvel_world;
-		Eigen::Map<Vector3d>{snap.acceleration} = m_accel_world;
-		Eigen::Map<Vector3d>{snap.last_good_position} = last_good_position;
-		snap.acceleration_var_max =
-		    Eigen::SelfAdjointEigenSolver<Mat3>(m_P.block<3, 3>(EBA, EBA), Eigen::EigenvaluesOnly)
-		        .eigenvalues()
-		        .maxCoeff();
-		snap.filter_time_ns = filter_time_ns;
-		snap.last_optical_ns = last_optical_ns;
-		snap.body_anchored = m_body_anchored;
-		const PredictedEstimate est = predicted_estimate(snap, when_ns);
-		const LedViewCache vc = make_view_cache(view);
-		const Mat3 R = est.orientation.toRotationMatrix();
-		const Vector3d led_obj = map_vec3(o.led_obj).cast<double>();
+		if (!prior.valid) { return false; }
+		LedViewCache vc;
+		vc.R_cw = map_quat(view.cam_world_orient).cast<double>().normalized().toRotationMatrix();
+		vc.t_cw = map_vec3(view.cam_world_pos).cast<double>();
+		vc.fx = view.fx; vc.fy = view.fy; vc.cx = view.cx; vc.cy = view.cy;
 		Vector2d zhat;
 		Eigen::Matrix<double, 2, 15> H;
-		led_project_jacobian(vc, R, est.position, led_obj, zhat, H); // SAME model as fold_led_observations
-		// S = H P H^T + R, with R = LED_PIXEL_STD^2 I (the fold's default measurement noise).
-		const Eigen::Matrix2d Rmeas = Vector2d{LED_PIXEL_STD * LED_PIXEL_STD, LED_PIXEL_STD * LED_PIXEL_STD}.asDiagonal();
-		const Eigen::Matrix2d S = H * m_P * H.transpose() + Rmeas;
-		if (!zhat.allFinite() || !S.allFinite()) {
-			return false;
-		}
-		if (out_zhat != nullptr) {
-			out_zhat[0] = (float)zhat[0];
-			out_zhat[1] = (float)zhat[1];
-		}
-		if (out_S != nullptr) {
-			out_S[0] = (float)S(0, 0);
-			out_S[1] = (float)S(0, 1);
-			out_S[2] = (float)S(1, 0);
-			out_S[3] = (float)S(1, 1);
-		}
+		led_project_jacobian(vc, map_quat(prior.relation.pose.orientation).cast<double>().toRotationMatrix(),
+		                     map_vec3(prior.relation.pose.position).cast<double>(),
+		                     map_vec3(o.led_obj).cast<double>(), zhat, H);
+		Eigen::Matrix<double, 2, 6> H6;
+		H6.leftCols<3>() = H.block<2, 3>(0, EP);
+		H6.rightCols<3>() = H.block<2, 3>(0, ET);
+		const Eigen::Map<const Eigen::Matrix<double, 6, 6, Eigen::RowMajor>> P(prior.pose_covariance);
+		const Eigen::Matrix2d S = H6 * P * H6.transpose() +
+		    Eigen::Matrix2d::Identity() * (LED_PIXEL_STD * LED_PIXEL_STD);
+		if (!zhat.allFinite() || !S.allFinite()) { return false; }
+		if (out_zhat) { out_zhat[0] = zhat[0]; out_zhat[1] = zhat[1]; }
+		if (out_S) { out_S[0] = S(0,0); out_S[1] = S(0,1); out_S[2] = S(1,0); out_S[3] = S(1,1); }
 		return true;
+	}
+
+	bool
+	EskfFusion::predict_led_gate(timepoint_ns when_ns, const LEDObservation &o,
+	                             const LEDCameraView &view, float out_zhat[2], float out_S[4])
+	{
+		t_estimator_prior prior;
+		return get_estimator_prior(when_ns, &prior) && project_prior_led_gate(prior, o, view, out_zhat, out_S);
 	}
 
 	bool
@@ -3103,7 +3253,7 @@ namespace {
 		const double resid = (pos - m_x.p).norm();
 		if (resid > REANCHOR_SNAP_M || resid > residual_limit) {
 			(void)fold_optical_velocity_measurement(pos, pos_variance);
-			reanchor(pos, flip_guard(orient)); // gyro-arbitrated: a flipped PnP re-anchors position only
+			reanchor_with_gyro_guard(pos, orient); // gyro-arbitrated: a flipped PnP re-anchors position only
 			mark_optical_adopted(true, false, OpticalHistory::Keep, pos_variance);
 			return true;
 		}
@@ -3135,14 +3285,17 @@ namespace {
 			ok = ekf_update(H, r, R);
 		}
 		if (!ok) {
-			reanchor(pos, flip_guard(orient));
+			reanchor_with_gyro_guard(pos, orient);
 			mark_optical_adopted(true, false, OpticalHistory::Keep, pos_variance);
 			return false;
 		}
 		if (!fold_optical_velocity_measurement(pos, pos_variance)) {
-			reanchor(pos, flip_guard(orient));
+			reanchor_with_gyro_guard(pos, orient);
 			mark_optical_adopted(true, true, OpticalHistory::Keep, pos_variance);
 			return false;
+		}
+		if (!ori_flip) {
+			commit_orientation_reference(orient, filter_time_ns);
 		}
 		mark_optical_adopted(true, true, OpticalHistory::Record, pos_variance);
 		return true;
@@ -3211,7 +3364,9 @@ namespace {
 	{
 		if (!m_anchor_valid || !tracked || filter_time_ns == 0 || t_pose >= filter_time_ns) {
 			propagate_to(t_pose);
-			apply();
+			if (!m_confirmed_idle) {
+				apply();
+			}
 			m_anchor = capture_checkpoint();
 			m_anchor_valid = true;
 			m_imu_log.clear();
@@ -3227,38 +3382,50 @@ namespace {
 		// m_imu_log — a range-for's saved iterators would then be invalidated (UB), and any further
 		// integration or anchor capture would resurrect the state the reset just discarded.
 		restore_checkpoint(m_anchor);
+		rewind_estimator_history(filter_time_ns);
 		for (size_t i = 0; i < m_imu_log.size(); i++) {
 			if (m_imu_log[i].sample.timestamp_ns > t_pose) {
 				break;
 			}
-			if (!integrate_imu_sample(m_imu_log[i].sample)) {
+			if (!integrate_input_event(m_imu_log[i])) {
 				// Reset mid-rewind: anchor and log are gone; do NOT apply the lagged optical or
 				// re-capture an anchor from the reset state. The next in-order optical re-seeds.
 				return false;
 			}
+			record_estimator_history();
 		}
 		propagate_to(t_pose);
-		apply();
+		if (!m_confirmed_idle) {
+			apply();
+		}
 
+		record_estimator_history();
 		m_anchor = capture_checkpoint();
 		while (!m_imu_log.empty() && m_imu_log.front().sample.timestamp_ns <= t_pose) {
 			m_imu_log.pop_front();
 		}
 		for (size_t i = 0; i < m_imu_log.size(); i++) {
-			if (!integrate_imu_sample(m_imu_log[i].sample)) {
+			if (!integrate_input_event(m_imu_log[i])) {
 				break; // reset mid-tail-replay: the reset cleared the log and anchor validity
 			}
+			record_estimator_history();
 		}
 		return true;
 	}
 
 	void
-	EskfFusion::integrate_late_imu_sample(const xrt_imu_sample &sample)
+	EskfFusion::integrate_late_imu_sample(const xrt_imu_sample &sample, bool idle_status)
 	{
 		// No anchor to rewind to (untracked / not yet checkpointed): integrate in place. The dt<=0 guard in
 		// integrate_imu_sample handles a true duplicate; there is no earlier state to reorder against anyway.
 		if (!m_anchor_valid || filter_time_ns == 0) {
-			integrate_imu_sample(sample);
+			integrate_input_event(ImuLogEntry{sample, idle_status});
+			return;
+		}
+		// Never promote a superseded sleep status or pre-sleep IMU packet into a new event after
+		// the rewind horizon. That would manufacture an idle transition or wake a sleeping device.
+		if (sample.timestamp_ns <= m_anchor.filter_time_ns &&
+		    (idle_status || (m_confirmed_idle && sample.timestamp_ns < m_idle_start_ns))) {
 			return;
 		}
 		// Insert at the sample's true time, clamped up to just past the rewind horizon so a packet older than
@@ -3271,17 +3438,19 @@ namespace {
 		// Splice into the timestamp-sorted log (the replay loops assume sorted order).
 		auto at = std::find_if(m_imu_log.begin(), m_imu_log.end(),
 		                       [&](const ImuLogEntry &e) { return e.sample.timestamp_ns > s.timestamp_ns; });
-		m_imu_log.insert(at, ImuLogEntry{s});
+		m_imu_log.insert(at, ImuLogEntry{s, idle_status});
 
 		// Rewind to the anchor and replay the (now-reordered) log forward: the late sample folds exactly as if
 		// it had arrived in order, and the filter clock returns to the latest sample as before. Index-based +
 		// abort-on-reset for the same reason as apply_optical_at (a spliced anomaly can complete a run of 10
 		// mid-replay and clear the log under the loop).
 		restore_checkpoint(m_anchor);
+		rewind_estimator_history(filter_time_ns);
 		for (size_t i = 0; i < m_imu_log.size(); i++) {
-			if (!integrate_imu_sample(m_imu_log[i].sample)) {
+			if (!integrate_input_event(m_imu_log[i])) {
 				break;
 			}
+			record_estimator_history();
 		}
 	}
 
@@ -3290,34 +3459,40 @@ namespace {
 	// ---------------------------------------------------------------------------
 
 	void
+	EskfFusion::process_input_event(const ImuLogEntry &event)
+	{
+		std::lock_guard<std::mutex> lock(m_filter_lock);
+		if (!tracked) {
+			return;
+		}
+		if (event.sample.timestamp_ns < filter_time_ns) {
+			integrate_late_imu_sample(event.sample, event.idle_status);
+		} else {
+			integrate_input_event(event);
+			m_imu_log.push_back(event);
+		}
+		if (m_imu_log.size() > IMU_LOG_CAP) {
+			m_anchor = capture_checkpoint();
+			m_anchor_valid = true;
+			m_imu_log.clear();
+		}
+		publish_snapshot();
+	}
+
+	void
+	EskfFusion::process_idle_status(timepoint_ns timestamp_ns)
+	{
+		xrt_imu_sample status{};
+		status.timestamp_ns = timestamp_ns;
+		process_input_event(ImuLogEntry{status, true});
+	}
+
+	void
 	EskfFusion::process_imu_data(const struct xrt_imu_sample *sample,
 	                             const struct xrt_vec3 * /*accel_variance_optional*/,
 	                             const struct xrt_vec3 * /*gyro_variance_optional*/)
 	{
-		// The ESKF treats IMU as a propagation INPUT (process noise = SIGMA_A/SIGMA_G spectral
-		// densities), not as a measurement, so the caller's optional measurement variances do not apply.
-		{
-			std::lock_guard<std::mutex> lock(m_filter_lock);
-			if (tracked) {
-				if (sample->timestamp_ns < filter_time_ns) {
-					// Strictly-late (reordered) BT packet — carries a real inertial interval BEFORE the
-					// current clock. Reorder it into the log and rewind-replay so it folds in sequence
-					// instead of being silently dropped. A sample AT the clock (==) is a duplicate / a
-					// co-timestamped pair with optical: it has no interval to integrate, so it takes the
-					// normal path where the dt<=0 guard makes it a harmless no-op.
-					integrate_late_imu_sample(*sample);
-				} else {
-					integrate_imu_sample(*sample);
-					m_imu_log.push_back(ImuLogEntry{*sample});
-				}
-				if (m_imu_log.size() > IMU_LOG_CAP) {
-					m_anchor = capture_checkpoint();
-					m_anchor_valid = true;
-					m_imu_log.clear();
-				}
-				publish_snapshot();
-			}
-		}
+		process_input_event(ImuLogEntry{*sample, false});
 		if (m_recorder) {
 			m_recorder->process_imu_data(sample);
 		}
@@ -3338,6 +3513,9 @@ namespace {
 		}
 
 		std::lock_guard<std::mutex> lock(m_filter_lock);
+		if (m_confirmed_idle || optical_during_idle(timestamp_ns)) {
+			return;
+		}
 		set_op_hmd_pose(hmd_world_pose);
 		// Pre-filter the re-anchor cache against the gyro reference (pure test, no adoption side-effect):
 		// a flipped PnP must never become the divergence snap target. Same reference the fold veto uses.
@@ -3374,66 +3552,36 @@ namespace {
 		{
 			std::lock_guard<std::mutex> lock(m_filter_lock);
 			set_op_hmd_pose(hmd_world_pose);
-			if (finite) {
-				// Re-anchor hygiene: m_pnp_pose is the pose the divergence re-anchor snaps onto, so it
-				// must never be a mirror-flipped solve. The front-end's anisotropic prior cost down-ranks
-				// flips it can see, but offline (and during a stale-yaw dropout) one can slip
-				// through; as a filter-side second line, reject a candidate whose orientation grossly
-				// disagrees with the FRESH gyro DEAD-RECKONED reference (the same arbitration the fold uses,
-				// so the cache and the fold agree on this sample) from becoming the re-anchor reference. A
-				// flipped pose then cannot poison the re-anchor. Bootstrap (untracked, no gyro reference yet)
-				// always takes it — the plausibility gate below guards a bad bootstrap. Same lock-in release
-				// as the fold path: a SUSTAINED disagreement frees the gate so a correct pose can re-seed the
-				// re-anchor reference instead of being vetoed forever by a wrong-basin reference.
-				const bool pnp_flipped = tracked && reject_orientation_flip(orient.normalized(),
-				                                                            sample->timestamp_ns);
-				// A discontinuous solve that the controller could not physically have reached from the
-				// last optical anchor (covariance-and-time-scaled bound) must not become the re-anchor
-				// cache — that is the snap target a per-LED divergence will jump onto. The bound
-				// self-widens through dropouts so a real re-acquisition still refreshes the cache.
-				const bool pnp_motion_plausible = optical_motion_plausible(pos, sample->timestamp_ns);
-					if (!pnp_flipped && pnp_motion_plausible && position_plausible(pos)) {
+			// Ignored optical samples in the pure-inertial diagnostic must not advance the clock:
+			// a real IMU with that timestamp still needs to integrate its complete sensor interval.
+			if (finite && !(tracked && m_imu_only && sample->timestamp_ns > m_imu_only_until_ns)) {
+				apply_optical_at(sample->timestamp_ns, [&]() {
+					// Cache eligibility is not orientation adoption: rejected positions and same-sample
+					// per-LED/position-only updates must not replace the independent gyro reference.
+					const bool pnp_flipped = tracked && orientation_flip_vs_gyro(orient.normalized(), sample->timestamp_ns);
+					if (!pnp_flipped && optical_motion_plausible(pos, sample->timestamp_ns) && position_plausible(pos)) {
 						m_pnp_pose = sample->pose;
 						m_pnp_ns = sample->timestamp_ns;
 						m_pnp_valid = true;
 					}
-
-				if (!tracked) {
-					// Bootstrap only from a PLAUSIBLE pose. A constellation-tracked controller is within
-					// arm's reach OF THE HMD, so a degenerate few-blob PnP far from the head must not seed the
-					// filter — it would capture last_good_position at an impossible point and be reported
-					// (frozen) there. Mirrors the arm-reach gate at every other optical-adoption site; stay
-					// untracked until a real pose arrives.
-					if (position_plausible(pos)) {
-						apply_optical_at(sample->timestamp_ns,
-						                 [&]() { bootstrap_from_pose(sample->pose); });
-						if (m_imu_only && m_imu_only_until_ns == 0) {
-							m_imu_only_until_ns = sample->timestamp_ns + m_imu_only_bootstrap_ns;
+					if (!tracked) {
+						if (position_plausible(pos)) {
+							bootstrap_from_pose(sample->pose);
+							if (m_imu_only && m_imu_only_until_ns == 0) {
+								m_imu_only_until_ns = sample->timestamp_ns + m_imu_only_bootstrap_ns;
+							}
+						}
+					} else if (!(m_imu_only && sample->timestamp_ns > m_imu_only_until_ns)) {
+						const bool per_led_same_sample = m_last_led_fold_ns != 0 && sample->timestamp_ns == m_last_led_fold_ns;
+						const bool position_led_same_sample = m_last_position_led_fold_ns != 0 &&
+						    sample->timestamp_ns == m_last_position_led_fold_ns;
+						if (!per_led_same_sample) {
+							integrate_pose_measurement(sample->pose, pos_var, ori_var, residual_limit);
+						} else if (!position_led_same_sample) {
+							integrate_position_measurement(pos, pos_var, true);
 						}
 					}
-				} else if (m_imu_only && sample->timestamp_ns > m_imu_only_until_ns) {
-					// Pure-inertial diagnostic: bootstrap window elapsed -> ignore optical entirely.
-				} else {
-					// Dual mode: suppress the PnP pose only when this exact optical sample has
-					// already been folded through per-LED observations. A previous-frame fold is not
-					// the same measurement; using a recency window here drops real optical pose and
-					// velocity evidence just before an OOV coast.
-					const bool per_led_same_sample =
-					    m_last_led_fold_ns != 0 && sample->timestamp_ns == m_last_led_fold_ns;
-					const bool position_led_same_sample =
-					    m_last_position_led_fold_ns != 0 &&
-					    sample->timestamp_ns == m_last_position_led_fold_ns;
-					if (!per_led_same_sample) {
-						apply_optical_at(sample->timestamp_ns, [&]() {
-										integrate_pose_measurement(sample->pose, pos_var, ori_var,
-										                           residual_limit);
-									});
-						} else if (!position_led_same_sample) {
-							apply_optical_at(sample->timestamp_ns, [&]() {
-								integrate_position_measurement(pos, pos_var, true);
-							});
-						}
-				}
+				});
 			}
 			publish_snapshot();
 		}
@@ -3527,12 +3675,19 @@ namespace {
 				// the LEDs. Re-anchor to a fresh PnP pose (or just inflate P) so the gate widens and the
 				// LEDs re-enter next frame. Re-fold once at the inflated covariance.
 				if (seen >= REANCHOR_NMIN && folded < (int)std::ceil(REANCHOR_FRAC * seen)) {
+					// Re-anchor/inflation is speculative until the retry accepts evidence. Preserve the
+					// state AFTER the first fold, including any accepted subset and a prior PnP update.
+					const FilterCheckpoint before_recovery = capture_checkpoint();
+					const int prior_folded = folded;
+					const bool history_reset_before = m_history_reset_pending;
+					const bool gravity_valid_before = m_gravity_valid;
+					const double gravity_excess_before = m_gravity_excess_m_s2;
 					const Vector3d pnp_pos = map_vec3(m_pnp_pose.position).cast<double>();
 					const bool pnp_fresh = m_pnp_valid &&
 					    std::llabs((long long)(m_pnp_ns - timestamp_ns)) < REANCHOR_MAX_AGE_NS &&
 					    pnp_pos.allFinite() && position_plausible(pnp_pos);
 					if (pnp_fresh) {
-						reanchor(pnp_pos, flip_guard(map_quat(m_pnp_pose.orientation).cast<double>()));
+						reanchor_with_gyro_guard(pnp_pos, map_quat(m_pnp_pose.orientation).cast<double>());
 					} else {
 						// No fresh PnP: the filter is lost. Inflate P large so the gate admits the
 						// drifted LEDs and the re-fold re-solves the pose from them. Position evidence
@@ -3549,6 +3704,13 @@ namespace {
 					const float recovery_max_innov_px =
 					    max_innov_px > 0.0f ? std::max(max_innov_px, REANCHOR_MAX_INNOV_PX) : max_innov_px;
 					folded = fold_led_observations(obs, view, pixel_variance, recovery_max_innov_px, &seen2);
+					if (folded == 0) {
+						restore_checkpoint(before_recovery);
+						m_history_reset_pending = history_reset_before;
+						m_gravity_valid = gravity_valid_before;
+						m_gravity_excess_m_s2 = gravity_excess_before;
+						folded = prior_folded;
+					}
 				}
 			});
 			publish_snapshot();
@@ -3563,6 +3725,10 @@ namespace {
 		const Eigen::Map<const Vector3d> s_lvel{snap.linear_velocity};
 		const Eigen::Map<const Vector3d> s_acc{snap.acceleration};
 		const Eigen::Map<const Quaterniond> s_orient{snap.orientation};
+
+		if (snap.confirmed_idle) {
+			return PredictedEstimate{s_pos, s_orient, Vector3d::Zero(), true};
+		}
 
 		// Position leans on the directly-estimated VELOCITY; the noisy world ACCELERATION (power-limited IMU,
 		// amplified by the ½·a·dt² lever) is Wiener-damped by w=‖a‖²/(‖a‖²+σ_a²(dt)) — strong confident accel
@@ -3602,50 +3768,131 @@ namespace {
 		return est;
 	}
 
-	void
-	EskfFusion::get_predicted_pose(const timepoint_ns when_ns, struct xrt_space_relation *out_relation)
+	bool
+	EskfFusion::get_estimator_prior(timepoint_ns when_ns, t_estimator_prior *out)
 	{
-		// The matcher's ESTIMATION prior: the filter's honest belief (raw extrapolation), NOT the compositor's
-		// body-lock report — feeding the visual ride back as a prior misleads the front-end's gate/flip cost.
-		if (out_relation == NULL) {
-			return;
+		if (!out) { return false; }
+		std::lock_guard<std::mutex> lock(m_filter_lock);
+		*out = {};
+		out->timestamp_ns = when_ns;
+		out->world_generation = m_world_generation;
+		out->relation.pose.orientation.w = 1;
+		out->gravity_orientation.w = 1;
+		out->optical_age_ms = 1e9;
+		// upper_bound selects the latest actual state AT OR BEFORE capture. Later measurements cannot
+		// change a query through backward extrapolation. Real OOSM corrections rebuild the retained tail.
+		auto it = std::upper_bound(m_estimator_history.begin(), m_estimator_history.end(), when_ns,
+		    [](timepoint_ns t, const FilterCheckpoint &c) { return t < c.filter_time_ns; });
+		if (it == m_estimator_history.begin()) { return false; }
+		const FilterCheckpoint &c = *--it;
+		out->source_timestamp_ns = c.filter_time_ns;
+		const timepoint_ns residual_ns = when_ns - c.filter_time_ns;
+		if (!c.tracked || (!c.confirmed_idle && residual_ns > 5000000)) { return false; }
+		const double dt = c.confirmed_idle ? 0.0 : time_ns_to_s(residual_ns);
+		Vector3d p = c.nominal.p + c.nominal.v * dt;
+		Quaterniond q = (exp_quat(c.angvel_world * dt) * c.nominal.q).normalized();
+		Mat15 P = c.P;
+		if (dt > 0.0) {
+			// Bounded residual uses the existing pure CV covariance model, not a new IMU fold or current
+			// calibration. The actual IMU history supplies every complete interval; at most 5ms remains.
+			const bool post_imu = c.last_imu_ns != 0 && c.filter_time_ns == c.last_imu_ns;
+			const double ap = post_imu ? SIGMA_A * SIGMA_A : PROC_ACCEL_CV * PROC_ACCEL_CV;
+			const double gp = post_imu ? SIGMA_G * SIGMA_G : PROC_GYRO_CV * PROC_GYRO_CV;
+			Mat15 F = Mat15::Identity(), Q = Mat15::Zero();
+			F.block<3,3>(EP,EV) = Mat3::Identity() * dt;
+			Q.block<3,3>(EP,EP) = Mat3::Identity() * (ap * dt * dt * dt / 3.0);
+			Q.block<3,3>(EP,EV) = Q.block<3,3>(EV,EP) = Mat3::Identity() * (ap * dt * dt / 2.0);
+			Q.block<3,3>(EV,EV) = Mat3::Identity() * ap * dt;
+			Q.block<3,3>(ET,ET) = Mat3::Identity() * gp * dt;
+			Q.block<3,3>(EBA,EBA) = Mat3::Identity() * SIGMA_BA * SIGMA_BA * dt;
+			Q.block<3,3>(EBG,EBG) = Mat3::Identity() * SIGMA_BG * SIGMA_BG * dt;
+			P = F * P * F.transpose() + Q;
 		}
-		U_ZERO(out_relation);
-		out_relation->pose.orientation.w = 1;
-		const FilterSnapshot snap = read_snapshot();
-		if (!snap.tracked || snap.filter_time_ns == 0) {
-			return; // identity / untracked: the matcher falls back to reprojection (cold start)
-		}
-		const PredictedEstimate est = predicted_estimate(snap, when_ns);
-		map_vec3(out_relation->pose.position) = est.position.cast<float>();
-		map_quat(out_relation->pose.orientation) = est.orientation.cast<float>();
-		uint64_t flags = 0;
-		if (snap.position_valid) {
-			flags |= XRT_SPACE_RELATION_POSITION_VALID_BIT;
-			flags |= snap.position_tracked ? XRT_SPACE_RELATION_POSITION_TRACKED_BIT : 0;
-		}
-		if (snap.orientation_valid) {
-			flags |= XRT_SPACE_RELATION_ORIENTATION_VALID_BIT;
-			flags |= snap.orientation_tracked ? XRT_SPACE_RELATION_ORIENTATION_TRACKED_BIT : 0;
-		}
-		out_relation->relation_flags = (xrt_space_relation_flags)flags;
+		map_vec3(out->relation.pose.position) = p.cast<float>();
+		map_quat(out->relation.pose.orientation) = q.cast<float>();
+		map_vec3(out->relation.linear_velocity) = c.nominal.v.cast<float>();
+		map_vec3(out->relation.angular_velocity) = c.angvel_world.cast<float>();
+		out->optical_age_ms = c.last_optical_ns ? std::max(0.0, (when_ns - c.last_optical_ns) * 1e-6) : 1e9;
+		uint64_t flags = XRT_SPACE_RELATION_LINEAR_VELOCITY_VALID_BIT | XRT_SPACE_RELATION_ANGULAR_VELOCITY_VALID_BIT;
+		const bool fresh = c.last_optical_ns && when_ns - c.last_optical_ns <= OPTICAL_FREEZE_NS;
+		if (c.position_state.valid) { flags |= XRT_SPACE_RELATION_POSITION_VALID_BIT; }
+		if (c.orientation_state.valid) { flags |= XRT_SPACE_RELATION_ORIENTATION_VALID_BIT; }
+		if (fresh && c.position_state.tracked) { flags |= XRT_SPACE_RELATION_POSITION_TRACKED_BIT; }
+		if (fresh && c.orientation_state.tracked) { flags |= XRT_SPACE_RELATION_ORIENTATION_TRACKED_BIT; }
+		out->relation.relation_flags = (xrt_space_relation_flags)flags;
+		Eigen::Map<Eigen::Matrix<double,6,6,Eigen::RowMajor>> poseP(out->pose_covariance);
+		poseP.topLeftCorner<3,3>() = P.block<3,3>(EP,EP);
+		poseP.topRightCorner<3,3>() = P.block<3,3>(EP,ET);
+		poseP.bottomLeftCorner<3,3>() = P.block<3,3>(ET,EP);
+		poseP.bottomRightCorner<3,3>() = P.block<3,3>(ET,ET);
+		const auto worst_std = [](const Mat3 &m) { return std::sqrt(std::max(0.0,
+		    Eigen::SelfAdjointEigenSolver<Mat3>(m, Eigen::EigenvaluesOnly).eigenvalues().maxCoeff())); };
+		out->position_std_m = worst_std(P.block<3,3>(EP,EP));
+		out->orientation_std_rad = worst_std(P.block<3,3>(ET,ET));
+		out->yaw_std_rad = std::sqrt(std::max(0.0, P(ET+1,ET+1)));
+		Eigen::Matrix2d tilt;
+		tilt << P(ET,ET), P(ET,ET+2), P(ET+2,ET), P(ET+2,ET+2);
+		out->tilt_std_rad = std::sqrt(std::max(0.0, Eigen::SelfAdjointEigenSolver<Eigen::Matrix2d>(tilt,
+		    Eigen::EigenvaluesOnly).eigenvalues().maxCoeff()));
+		map_quat(out->gravity_orientation) = c.gravity_corrected_q.cast<float>();
+		out->gravity_valid = c.gravity_valid;
+		out->gravity_excess_m_s2 = c.gravity_excess_m_s2;
+		out->valid = true;
+		return true;
+	}
+
+	void
+	EskfFusion::get_predicted_pose(timepoint_ns when_ns, struct xrt_space_relation *out_relation)
+	{
+		if (!out_relation) { return; }
+		t_estimator_prior prior;
+		get_estimator_prior(when_ns, &prior);
+		*out_relation = prior.relation;
 	}
 
 	void
 	EskfFusion::get_prediction(timepoint_ns when_ns,
 	                           struct xrt_space_relation *out_relation,
-	                           const struct xrt_pose *hmd_world_pose)
+	                           const struct xrt_pose *hmd_world_pose,
+	                           struct xrt_pose *out_from_raw,
+	                           uint64_t *out_generation,
+	                           bool hmd_pose_is_presented)
 	{
 		if (out_relation == NULL) {
 			return;
 		}
+		std::lock_guard<std::mutex> report_lock(m_world_report_lock);
 		U_ZERO(out_relation);
 		out_relation->pose.orientation.w = 1;
 
 		const FilterSnapshot snap = read_snapshot();
+		if (out_from_raw != nullptr) {
+			u_world_reanchor_compensation_evaluate(&snap.presentation, when_ns, out_from_raw);
+		}
+		if (out_generation != nullptr) *out_generation = snap.presentation.generation;
+		struct xrt_pose hmd_in_raw;
+		if (hmd_pose_is_presented && hmd_world_pose != nullptr) {
+			struct xrt_pose correction, inverse;
+			u_world_reanchor_compensation_evaluate(&snap.presentation, when_ns, &correction);
+			math_pose_invert(&correction, &inverse);
+			math_pose_transform(&inverse, hmd_world_pose, &hmd_in_raw);
+			hmd_world_pose = &hmd_in_raw;
+		}
 		if (!snap.tracked || snap.filter_time_ns == 0) {
 			m_fusion_state.store(FusionState::Invalid, std::memory_order_relaxed);
 			return;
+		}
+		if (snap.confirmed_idle) {
+			map_vec3(out_relation->pose.position) = Eigen::Map<const Vector3d>{snap.position}.cast<float>();
+			map_quat(out_relation->pose.orientation) = Eigen::Map<const Quaterniond>{snap.orientation}.cast<float>();
+			uint32_t flags = XRT_SPACE_RELATION_ORIENTATION_VALID_BIT | XRT_SPACE_RELATION_POSITION_VALID_BIT |
+			    XRT_SPACE_RELATION_LINEAR_VELOCITY_VALID_BIT | XRT_SPACE_RELATION_ANGULAR_VELOCITY_VALID_BIT;
+			if (snap.last_optical_ns != 0 && when_ns - snap.last_optical_ns <= OPTICAL_FREEZE_NS) {
+				flags |= XRT_SPACE_RELATION_ORIENTATION_TRACKED_BIT | XRT_SPACE_RELATION_POSITION_TRACKED_BIT;
+			}
+			out_relation->relation_flags = (xrt_space_relation_flags)flags;
+			m_fusion_state.store(FusionState::WorldLocked, std::memory_order_relaxed);
+			return; // before every HMD-follow, re-entry, and arm-reach reporting transform
 		}
 		// Raw estimate (shared with the matcher's get_predicted_pose); this path layers the body-lock /
 		// reach / re-entry reporting transforms on top. s_avel feeds the reported angular velocity; s_lvel
@@ -3970,6 +4217,13 @@ namespace {
 
 } // namespace
 
+
+bool
+predict_led_gate_from_prior(const t_estimator_prior &prior, const LEDObservation &o,
+                           const LEDCameraView &view, float out_zhat[2], float out_S[4])
+{
+	return project_prior_led_gate(prior, o, view, out_zhat, out_S);
+}
 
 std::unique_ptr<KalmanFusionInterface>
 KalmanFusionInterface::create()

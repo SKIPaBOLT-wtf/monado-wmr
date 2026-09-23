@@ -10,6 +10,7 @@
 #pragma once
 
 #include "tracking/t_tracking.h"
+#include "tracking/t_estimator_prior.h"
 
 #include "xrt/xrt_defines.h"
 #include "xrt/xrt_frame.h"
@@ -29,6 +30,7 @@ struct tracking_sample_device_state
 {
 	/* Index into the devices array for this state info */
 	int dev_index;
+	const struct t_estimator_prior *estimator_prior; //!< points into owning sample, NULL for legacy devices
 
 	struct t_constellation_led_model *led_model;
 
@@ -98,6 +100,8 @@ struct tracking_sample_frame
 struct constellation_tracking_sample
 {
 	uint64_t timestamp; // Exposure timestamp
+	struct t_estimator_prior estimator_priors[CONSTELLATION_MAX_DEVICES];
+	bool estimator_prior_supported[CONSTELLATION_MAX_DEVICES];
 
 	/* Device poses at capture time */
 	struct tracking_sample_device_state devices[CONSTELLATION_MAX_DEVICES];

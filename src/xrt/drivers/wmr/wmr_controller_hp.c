@@ -196,7 +196,8 @@ static bool
 wmr_controller_hp_packet_parse(struct wmr_controller_hp *ctrl,
                                const unsigned char *buffer,
                                size_t len,
-                               struct wmr_controller_base_imu_sample *imu_sample)
+                               struct wmr_controller_base_imu_sample *imu_sample,
+                               bool *out_imu_valid)
 {
 	struct wmr_controller_hp_input *last_input = &ctrl->last_inputs;
 	struct wmr_controller_base *wcb = (struct wmr_controller_base *)(ctrl);
@@ -258,11 +259,6 @@ wmr_controller_hp_packet_parse(struct wmr_controller_hp *ctrl,
 	acc[0] = read24(&p); // x
 	acc[1] = read24(&p); // y
 	acc[2] = read24(&p); // z
-	vec3_from_wmr_controller_accel(acc, &imu_sample->acc);
-	math_matrix_3x3_transform_vec3(&wcb->config.sensors.accel.mix_matrix, &imu_sample->acc, &imu_sample->acc);
-	math_vec3_accum(&wcb->config.sensors.accel.bias_offsets, &imu_sample->acc);
-	math_quat_rotate_vec3(&wcb->config.sensors.transforms.P_oxr_acc.orientation, &imu_sample->acc,
-	                      &imu_sample->acc);
 
 	imu_sample->temperature = read16(&p);
 
@@ -270,13 +266,27 @@ wmr_controller_hp_packet_parse(struct wmr_controller_hp *ctrl,
 	gyro[0] = read24(&p);
 	gyro[1] = read24(&p);
 	gyro[2] = read24(&p);
+	imu_sample->timestamp_ticks = (uint32_t)read32(&p);
+
+	// HP status-only reports in low-power mode have all six raw IMU channels exactly zero.
+	// Test before calibration: factory bias offsets would turn this sentinel into false motion.
+	// A real sample with only zero gyro or only zero acceleration remains a measurement.
+	*out_imu_valid = acc[0] != 0 || acc[1] != 0 || acc[2] != 0 || gyro[0] != 0 || gyro[1] != 0 || gyro[2] != 0;
+	if (!*out_imu_valid) {
+		return true; // buttons, trigger and hardware timestamp are still a valid status update
+	}
+
+	vec3_from_wmr_controller_accel(acc, &imu_sample->acc);
+	math_matrix_3x3_transform_vec3(&wcb->config.sensors.accel.mix_matrix, &imu_sample->acc, &imu_sample->acc);
+	math_vec3_accum(&wcb->config.sensors.accel.bias_offsets, &imu_sample->acc);
+	math_quat_rotate_vec3(&wcb->config.sensors.transforms.P_oxr_acc.orientation, &imu_sample->acc,
+	                      &imu_sample->acc);
+
 	vec3_from_wmr_controller_gyro(gyro, &imu_sample->gyro);
 	math_matrix_3x3_transform_vec3(&wcb->config.sensors.gyro.mix_matrix, &imu_sample->gyro, &imu_sample->gyro);
 	math_vec3_accum(&wcb->config.sensors.gyro.bias_offsets, &imu_sample->gyro);
 	math_quat_rotate_vec3(&wcb->config.sensors.transforms.P_oxr_gyr.orientation, &imu_sample->gyro,
 	                      &imu_sample->gyro);
-
-	imu_sample->timestamp_ticks = (uint32_t)read32(&p);
 
 	/* Todo: More decoding here
 	    read16(&p); // Unknown. Seems to depend on controller orientation (probably mag)
@@ -293,11 +303,12 @@ static bool
 handle_input_packet(struct wmr_controller_base *wcb, uint64_t time_ns, uint8_t *buffer, uint32_t buf_size)
 {
 	struct wmr_controller_hp *ctrl = (struct wmr_controller_hp *)(wcb);
-	struct wmr_controller_base_imu_sample imu_sample;
+	struct wmr_controller_base_imu_sample imu_sample = {0};
+	bool imu_valid = false;
 
-	bool b = wmr_controller_hp_packet_parse(ctrl, buffer, buf_size, &imu_sample);
+	bool b = wmr_controller_hp_packet_parse(ctrl, buffer, buf_size, &imu_sample, &imu_valid);
 	if (b) {
-		wmr_controller_base_imu_sample(wcb, &imu_sample, (timepoint_ns)time_ns);
+		wmr_controller_base_imu_sample(wcb, &imu_sample, (timepoint_ns)time_ns, imu_valid);
 	}
 
 	return b;

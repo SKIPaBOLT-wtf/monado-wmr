@@ -17,6 +17,9 @@
 #include "wmr_config.h"
 
 #include <assert.h>
+#include <float.h>
+#include <math.h>
+#include <stdio.h>
 #include <string.h>
 
 
@@ -35,6 +38,198 @@
 
 //! Specifies the maximum number of cameras to use for SLAM tracking
 DEBUG_GET_ONCE_NUM_OPTION(wmr_max_slam_cams, "WMR_MAX_SLAM_CAMS", WMR_MAX_CAMERAS)
+
+//! Disabled by default: only a same-device, exact-factory HT1 correction is accepted.
+DEBUG_GET_ONCE_OPTION(wmr_ht1_extrinsics_override, "WMR_HT1_EXTRINSICS_OVERRIDE", NULL)
+
+static bool
+wmr_json_has_unique_keys(const cJSON *node)
+{
+	const cJSON *item = NULL;
+	cJSON_ArrayForEach(item, node)
+	{
+		if (cJSON_IsObject(node)) {
+			if (item->string == NULL) {
+				return false;
+			}
+			for (const cJSON *other = item->next; other != NULL; other = other->next) {
+				if (other->string == NULL || strcmp(item->string, other->string) == 0) {
+					return false;
+				}
+			}
+		}
+		if (!wmr_json_has_unique_keys(item)) {
+			return false;
+		}
+	}
+	return true;
+}
+
+static bool
+wmr_json_string_equals(const cJSON *node, const char *key, const char *expected)
+{
+	const char *value = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(node, key));
+	return value != NULL && strcmp(value, expected) == 0;
+}
+
+static bool
+wmr_json_equal_exact(const cJSON *a, const cJSON *b)
+{
+	if (!cJSON_Compare(a, b, true)) {
+		return false;
+	}
+	// cJSON_Compare allows a relative epsilon for numbers. Factory gates do not.
+	if (cJSON_IsNumber(a)) {
+		return isfinite(a->valuedouble) && a->valuedouble == b->valuedouble;
+	}
+	const cJSON *item = NULL;
+	int index = 0;
+	cJSON_ArrayForEach(item, a)
+	{
+		const cJSON *other = cJSON_IsObject(a) ? cJSON_GetObjectItemCaseSensitive(b, item->string)
+		                                    : cJSON_GetArrayItem(b, index++);
+		if (!wmr_json_equal_exact(item, other)) {
+			return false;
+		}
+	}
+	return true;
+}
+
+static bool
+wmr_json_finite_array(const cJSON *node, int count, double *values)
+{
+	if (!cJSON_IsArray(node) || cJSON_GetArraySize(node) != count) {
+		return false;
+	}
+	for (int i = 0; i < count; i++) {
+		const cJSON *value = cJSON_GetArrayItem(node, i);
+		if (!cJSON_IsNumber(value) || !isfinite(value->valuedouble) || fabs(value->valuedouble) > FLT_MAX) {
+			return false;
+		}
+		values[i] = value->valuedouble;
+	}
+	return true;
+}
+
+bool
+wmr_hmd_config_apply_ht1_override(cJSON *factory_info, const cJSON *override, enum u_logging_level log_level)
+{
+	const char *reason = "invalid schema, units, frame or keys";
+	if (!cJSON_IsObject(override) || cJSON_GetArraySize(override) != 6 ||
+	    !wmr_json_has_unique_keys(override) || !wmr_json_has_unique_keys(factory_info) ||
+	    !wmr_json_string_equals(override, "schema", "wmr_ht1_extrinsics_v1") ||
+	    !wmr_json_string_equals(override, "translation_units", "meters") ||
+	    !wmr_json_string_equals(override, "coordinate_frame", "wmr_factory_ht0") ||
+	    !wmr_json_string_equals(override, "camera_location", "CALIBRATION_CameraLocationHT1")) {
+		goto reject;
+	}
+
+	// Exact semantic equality covers serial, all metadata, original Rt and every other
+	// factory field. No new hash dependency, rounding tolerance or generic G2 fallback.
+	const cJSON *expected = cJSON_GetObjectItemCaseSensitive(override, "expected_factory");
+	const cJSON *metadata = cJSON_GetObjectItemCaseSensitive(factory_info, "Metadata");
+	const char *serial = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(metadata, "SerialId"));
+	reason = "device or complete expected factory calibration mismatch";
+	if (!cJSON_IsObject(factory_info) || !cJSON_IsObject(expected) || serial == NULL || serial[0] == '\0' ||
+	    !wmr_json_equal_exact(factory_info, expected)) {
+		goto reject;
+	}
+
+	cJSON *camera = NULL;
+	cJSON *item = NULL;
+	cJSON *cameras = cJSON_GetObjectItemCaseSensitive(factory_info, "Cameras");
+	reason = "missing or ambiguous head-tracking HT1 camera";
+	if (!cJSON_IsArray(cameras)) {
+		goto reject;
+	}
+	cJSON_ArrayForEach(item, cameras)
+	{
+		if (wmr_json_string_equals(item, "Location", "CALIBRATION_CameraLocationHT1")) {
+			if (camera != NULL ||
+			    !wmr_json_string_equals(item, "Purpose", "CALIBRATION_CameraPurposeHeadTracking")) {
+				goto reject;
+			}
+			camera = item;
+		}
+	}
+	if (camera == NULL || !cJSON_IsObject(cJSON_GetObjectItemCaseSensitive(camera, "Rt"))) {
+		goto reject;
+	}
+
+	const cJSON *rt = cJSON_GetObjectItemCaseSensitive(override, "replacement_rt");
+	double r[9], t[3];
+	reason = "replacement Rt must contain finite 3x3 rotation and metre translation";
+	if (!cJSON_IsObject(rt) || cJSON_GetArraySize(rt) != 2 ||
+	    !wmr_json_finite_array(cJSON_GetObjectItemCaseSensitive(rt, "Rotation"), 9, r) ||
+	    !wmr_json_finite_array(cJSON_GetObjectItemCaseSensitive(rt, "Translation"), 3, t)) {
+		goto reject;
+	}
+
+	// Validate a proper rotation; this tolerance only permits float serialization error.
+	reason = "replacement rotation is not rigid and right-handed";
+	for (int i = 0; i < 3; i++) {
+		for (int j = 0; j < 3; j++) {
+			double dot = 0.0;
+			for (int k = 0; k < 3; k++) {
+				dot += r[3 * i + k] * r[3 * j + k];
+			}
+			if (fabs(dot - (i == j ? 1.0 : 0.0)) > 1e-5) {
+				goto reject;
+			}
+		}
+	}
+	double det = r[0] * (r[4] * r[8] - r[5] * r[7]) - r[1] * (r[3] * r[8] - r[5] * r[6]) +
+	             r[2] * (r[3] * r[7] - r[4] * r[6]);
+	if (fabs(det - 1.0) > 1e-5) {
+		goto reject;
+	}
+
+	// All checks and allocations precede the one mutation. Existing factory values
+	// survive any malformed/mismatched config or allocation failure.
+	cJSON *replacement = cJSON_Duplicate(rt, true);
+	reason = "could not allocate replacement Rt";
+	if (replacement == NULL) {
+		goto reject;
+	}
+	if (!cJSON_ReplaceItemInObjectCaseSensitive(camera, "Rt", replacement)) {
+		cJSON_Delete(replacement);
+		reason = "could not replace factory HT1 Rt";
+		goto reject;
+	}
+	WMR_INFO(log_level, "Applied same-device HT1 camera extrinsics override; all other factory fields preserved");
+	return true;
+
+reject:
+	WMR_WARN(log_level, "HT1 camera extrinsics override rejected (%s); retaining factory calibration", reason);
+	return false;
+}
+
+static void
+wmr_hmd_config_try_ht1_override(cJSON *factory_info, enum u_logging_level log_level)
+{
+	const char *path = debug_get_option_wmr_ht1_extrinsics_override();
+	if (path == NULL || path[0] == '\0') {
+		return;
+	}
+	// Bound the local override input and require one complete JSON document.
+	char buffer[65536 + 1];
+	FILE *file = fopen(path, "rb");
+	if (file == NULL) {
+		WMR_WARN(log_level, "Cannot read HT1 camera extrinsics override; retaining factory calibration");
+		return;
+	}
+	size_t size = fread(buffer, 1, sizeof(buffer) - 1, file);
+	bool invalid = ferror(file) || !feof(file) || memchr(buffer, '\0', size) != NULL;
+	fclose(file);
+	buffer[size] = '\0';
+	cJSON *override = invalid ? NULL : cJSON_ParseWithLengthOpts(buffer, size + 1, NULL, true);
+	if (override == NULL) {
+		WMR_WARN(log_level, "Invalid or oversized HT1 camera extrinsics override JSON; retaining factory calibration");
+		return;
+	}
+	wmr_hmd_config_apply_ht1_override(factory_info, override, log_level);
+	cJSON_Delete(override);
+}
 
 static void
 wmr_hmd_config_init_defaults(struct wmr_hmd_config *c)
@@ -523,6 +718,7 @@ wmr_hmd_config_parse(struct wmr_hmd_config *c, char *json_string, enum u_logging
 		return false;
 	}
 
+	wmr_hmd_config_try_ht1_override(calib_info, log_level);
 	bool res = wmr_config_parse_calibration(c, calib_info, log_level);
 
 	cJSON_Delete(json_root);

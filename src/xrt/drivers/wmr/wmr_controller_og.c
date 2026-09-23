@@ -366,7 +366,7 @@ handle_input_packet(struct wmr_controller_base *wcb, uint64_t time_ns, uint8_t *
 
 	bool b = wmr_controller_og_packet_parse(ctrl, buffer, buf_size, &imu_sample);
 	if (b) {
-		wmr_controller_base_imu_sample(wcb, &imu_sample, (timepoint_ns)time_ns);
+		wmr_controller_base_imu_sample(wcb, &imu_sample, (timepoint_ns)time_ns, true);
 	}
 
 	return b;

@@ -45,6 +45,8 @@
 #define WMR_ASSERT_(predicate) WMR_ASSERT(predicate, "Assertion failed " #predicate)
 
 DEBUG_GET_ONCE_LOG_OPTION(wmr_log, "WMR_LOG", U_LOGGING_INFO)
+// Keep the fork's previous estimator available for a controlled comparison.
+DEBUG_GET_ONCE_BOOL_OPTION(wmr_clock_windowed, "WMR_CLOCK_WINDOWED", false)
 
 /*!
  * Handles all the data sources from the WMR driver
@@ -80,14 +82,17 @@ struct wmr_source
 	bool first_imu_received;  //!< Don't send frames until first IMU sample
 	timepoint_ns last_imu_ns; //!< Last timepoint received.
 
-	/*! The one hw->mono conversion authority for every stream of the shared USB device:
-	 * a windowed min-skew tracker fed from IMU sample arrivals. Minima correspond to the
-	 * lowest-delay arrivals, so USB churn — which can only ever ADD delay — cannot inflate
-	 * the estimate the way the previous arrival-mean exponential filter did (~100 ms
-	 * launch-window wobble, the 2026-07-06 Basalt-abort class). Guarded by hw2mono_lock:
-	 * the IMU (HID) thread pushes observations, the camera (USB) thread samples it. */
+	/*! One hw->mono authority for IMU and cameras, guarded by hw2mono_lock. Use the
+	 * original arrival-offset filter by default; retain the windowed estimator for A/B. */
 	struct os_mutex hw2mono_lock;
 	struct m_clock_windowed_skew_tracker *hw2mono_clock;
+	bool use_windowed_clock;
+	bool hw2mono_valid;
+	time_duration_ns hw2mono;
+	timepoint_ns last_imu_hw_ns;
+	timepoint_ns last_imu_arrival_ns;
+	uint32_t imu_late_run;
+	uint64_t imu_stabilised_total;
 
 	/*! hw2mono offset sampled once per camera group (at cam0) so all views of a group and
 	 * the interleaved controller frames convert identically. Only touched from the camera
@@ -115,8 +120,11 @@ static void
 wmr_source_update_cam_hw2mono(struct wmr_source *ws, timepoint_ns group_hw_ts)
 {
 	os_mutex_lock(&ws->hw2mono_lock);
-	timepoint_ns mono_ts = 0;
-	bool have = m_clock_windowed_skew_tracker_to_local(ws->hw2mono_clock, group_hw_ts, &mono_ts);
+	timepoint_ns mono_ts = group_hw_ts + ws->hw2mono;
+	bool have = ws->hw2mono_valid;
+	if (ws->use_windowed_clock) {
+		have = m_clock_windowed_skew_tracker_to_local(ws->hw2mono_clock, group_hw_ts, &mono_ts);
+	}
 	os_mutex_unlock(&ws->hw2mono_lock);
 	if (have) {
 		ws->cam_hw2mono = mono_ts - group_hw_ts;
@@ -182,6 +190,48 @@ void (*receive_cam[WMR_MAX_CAMERAS])(struct xrt_frame_sink *, struct xrt_frame *
     receive_cam3, //
 };
 
+//! Called only by the IMU thread with hw2mono_lock held.
+static timepoint_ns
+wmr_source_original_hw2mono(struct wmr_source *ws, timepoint_ns now_hw, timepoint_ns now_mono)
+{
+	// Preserve the original filter's coefficient for this comparison. The old driver also
+	// used 250 Hz here when forwarding all four samples of a 1 kHz IMU packet.
+	const float imu_freq = 250.f;
+	const time_duration_ns late_threshold_ns = 50 * U_TIME_1MS_IN_NS;
+	const uint32_t reseed_after_late_run = 25;
+	time_duration_ns observed_offset = now_mono - now_hw;
+
+	// Wintch/reverb-g2 patch 0093: after an arrival stall, queued samples drain faster than
+	// device time. Do not learn the stall as a new clock offset. A sustained offset change
+	// with a normally spaced arrival may re-seed; unlike the old filter this avoids dragging
+	// the first live sample seconds into the future after a backlog.
+	if (ws->hw2mono_valid && observed_offset - ws->hw2mono > late_threshold_ns) {
+		time_duration_ns mono_gap = now_mono - ws->last_imu_arrival_ns;
+		time_duration_ns hw_gap = now_hw - ws->last_imu_hw_ns;
+		bool draining = ws->last_imu_arrival_ns != 0 && hw_gap > 0 && mono_gap * 2 < hw_gap;
+		ws->imu_late_run++;
+		if (!draining && ws->imu_late_run >= reseed_after_late_run) {
+			WMR_WARN(ws, "IMU clock offset re-seeded after %u late samples (%.1f ms change)",
+			         ws->imu_late_run, (double)(observed_offset - ws->hw2mono) / 1e6);
+			ws->hw2mono = observed_offset;
+			ws->imu_late_run = 0;
+		} else if (ws->imu_late_run == 1) {
+			WMR_INFO(ws, "Holding IMU clock offset during late arrivals (%.1f ms late)",
+			         (double)(observed_offset - ws->hw2mono) / 1e6);
+		}
+	} else {
+		if (ws->imu_late_run > 0) {
+			WMR_INFO(ws, "IMU arrivals recovered after %u held-offset samples", ws->imu_late_run);
+		}
+		ws->imu_late_run = 0;
+		m_clock_offset_a2b(imu_freq, now_hw, now_mono, &ws->hw2mono);
+	}
+	ws->hw2mono_valid = true;
+	ws->last_imu_hw_ns = now_hw;
+	ws->last_imu_arrival_ns = now_mono;
+	return now_hw + ws->hw2mono;
+}
+
 static void
 receive_imu_sample(struct xrt_imu_sink *sink, struct xrt_imu_sample *s)
 {
@@ -193,13 +243,32 @@ receive_imu_sample(struct xrt_imu_sink *sink, struct xrt_imu_sample *s)
 	timepoint_ns now_hw = s->timestamp_ns;
 	timepoint_ns now_mono = (timepoint_ns)os_monotonic_get_ns();
 	os_mutex_lock(&ws->hw2mono_lock);
-	m_clock_windowed_skew_tracker_push(ws->hw2mono_clock, now_mono, now_hw);
 	timepoint_ns ts = 0;
-	bool have = m_clock_windowed_skew_tracker_to_local(ws->hw2mono_clock, now_hw, &ts);
+	bool have = true;
+	if (ws->use_windowed_clock) {
+		m_clock_windowed_skew_tracker_push(ws->hw2mono_clock, now_mono, now_hw);
+		have = m_clock_windowed_skew_tracker_to_local(ws->hw2mono_clock, now_hw, &ts);
+	} else {
+		ts = wmr_source_original_hw2mono(ws, now_hw, now_mono);
+	}
 	os_mutex_unlock(&ws->hw2mono_lock);
 	if (!have) {
 		WMR_DEBUG(ws, "Dropping IMU sample until the clock estimator synchronises, hw ts %" PRId64, now_hw);
 		return;
+	}
+
+	// Wintch/reverb-g2 patch 0022: preserve a sample when the arrival-offset filter causes
+	// a small backwards step. Keep this floor local to the IMU sample: feeding it back into
+	// hw2mono would ratchet the shared camera/IMU clock forward. Large discontinuities still
+	// take the existing rejection path, and the windowed A/B path remains unchanged.
+	if (!ws->use_windowed_clock && ws->last_imu_ns >= ts &&
+	    ws->last_imu_ns - ts < 20 * U_TIME_1MS_IN_NS) {
+		ts = ws->last_imu_ns + 250 * U_TIME_1US_IN_NS;
+		ws->imu_stabilised_total++;
+		if (ws->imu_stabilised_total % 1000 == 1) {
+			WMR_INFO(ws, "Preserved IMU sample after clock-offset jitter (%" PRIu64 " total)",
+			         ws->imu_stabilised_total);
+		}
 	}
 
 	/*
@@ -389,6 +458,8 @@ wmr_source_create(struct xrt_frame_context *xfctx,
 
 	ws->hw2mono_clock = m_clock_windowed_skew_tracker_alloc(WMR_HW2MONO_WINDOW_SAMPLES);
 	os_mutex_init(&ws->hw2mono_lock);
+	ws->use_windowed_clock = debug_get_bool_option_wmr_clock_windowed();
+	WMR_INFO(ws, "WMR clock mode: %s", ws->use_windowed_clock ? "windowed" : "original with backlog guard");
 
 	// Setup xrt_fs
 	struct xrt_fs *xfs = &ws->xfs;

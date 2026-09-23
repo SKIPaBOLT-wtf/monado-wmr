@@ -1,0 +1,103 @@
+{
+  "components": {
+    "body": {
+      "filename": "body.obj",
+      "component_local": {
+        "origin": [
+          0,
+          0,
+          0
+        ],
+        "rotate_xyz": [
+          0,
+          0,
+          0
+        ]
+      }
+    },
+    "tip": {
+      "component_local": {
+        "origin": [
+          -0.000683,
+          -0.02659872355520642,
+          -0.06471762533679451
+        ],
+        "rotate_xyz": [
+          -34.999910926695264,
+          0,
+          0
+        ]
+      }
+    },
+    "aim": {
+      "component_local": {
+        "origin": [
+          -0.000683,
+          -0.02659872355520642,
+          -0.06471762533679451
+        ],
+        "rotate_xyz": [
+          -34.999910926695264,
+          0,
+          0
+        ]
+      }
+    },
+    "openxr_aim": {
+      "component_local": {
+        "origin": [
+          -0.000683,
+          -0.02659872355520642,
+          -0.06471762533679451
+        ],
+        "rotate_xyz": [
+          -34.999910926695264,
+          0,
+          0
+        ]
+      }
+    },
+    "grip": {
+      "component_local": {
+        "origin": [
+          0,
+          0,
+          0
+        ],
+        "rotate_xyz": [
+          0,
+          0,
+          0
+        ]
+      }
+    },
+    "handgrip": {
+      "component_local": {
+        "origin": [
+          0,
+          0,
+          0
+        ],
+        "rotate_xyz": [
+          0,
+          0,
+          0
+        ]
+      }
+    },
+    "openxr_grip": {
+      "component_local": {
+        "origin": [
+          0,
+          0,
+          0
+        ],
+        "rotate_xyz": [
+          0,
+          0,
+          0
+        ]
+      }
+    }
+  }
+}

@@ -1,0 +1,11 @@
+# Source and asset provenance
+
+Runtime upstream: [AshishKumar4/monado-wmr](https://github.com/AshishKumar4/monado-wmr), `g2-linux-integration`, commit `431ee47b89565ce6cbf57ea43f3dad6d0361ec44`. That fork builds on [thaytan/monado](https://gitlab.freedesktop.org/thaytan/monado) and [Monado](https://gitlab.freedesktop.org/monado/monado). Git history is retained. The integration companion originates from [AshishKumar4/Project-VR](https://github.com/AshishKumar4/Project-VR), commit `d92aa7f1877ae8f77aff81e476dd90e881e652b2`.
+
+`import-manifest.json` identifies the exact 40 modified/added source-resource files brought forward from the tested local source snapshot. Three generated Python bytecode files were excluded. Additional public documentation, CMake presets and synthetic tests make this import independently reviewable. No device capture, account configuration, calibration payload or compiled driver is part of the import.
+
+The main project is BSL-1.0; individual components retain their SPDX identifiers and notices in `LICENSES/`. The optional VIT bias header is BSD-3-Clause. Preserve all third-party notices rather than relicensing the entire tree as one new project.
+
+The G2 left/right models come from the MIT-licensed assets package of [immersive-web/webxr-input-profiles](https://github.com/immersive-web/webxr-input-profiles/tree/f4992299601614adbfefd398dc8e281556bb7444/packages/assets/profiles/hp-mixed-reality), pinned to `f4992299601614adbfefd398dc8e281556bb7444`. Original GLB SHA-256: left `7c0c1f6576e51d977e1874b8a772657341d2a145f383f2f5407bd72bdff8112f`, right `a3b2796735429497039f0313ed22e8c2f52f78000eff8a4e3e382cae0c68a7e0`. Converted resources include their MIT license. Conversion applies scene-node transforms into grip space; aim and application hand poses remain separate concepts. Hardware trademarks identify the depicted controller and do not indicate vendor endorsement.
+
+Basalt is a separate dependency. The reference upstream release is [mateosss/basalt release-30ece25f](https://gitlab.freedesktop.org/mateosss/basalt/-/releases/release-30ece25f), source `30ece25f4c7d86e6a9dbee7ff0ebd0b921344a67`. A source-equivalent local rebuild is not automatically qualified as a runtime replacement; see STATUS.md.

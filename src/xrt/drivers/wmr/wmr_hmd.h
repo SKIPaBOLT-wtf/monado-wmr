@@ -39,7 +39,31 @@ extern "C" {
 /* Support 2 controllers on HP Reverb G2 */
 #define WMR_MAX_CONTROLLERS 2
 
+/* Only the HMD reader owns this queue. Firmware waits must not recursively create controllers.
+ * If it fills, the current initialization fails explicitly before reading another HID report. */
+#define WMR_PENDING_REPORT_CAPACITY 128
+struct wmr_pending_report
+{
+	uint64_t received_ns;
+	uint32_t size;
+	uint8_t data[WMR_FEATURE_BUFFER_SIZE];
+};
+
 struct wmr_hmd;
+
+//! Optional diagnostics, owned exclusively by the sensor reading thread.
+struct wmr_imu_diagnostics
+{
+	uint64_t window_start_ns;
+	uint64_t next_window_ns;
+	uint64_t sample_count;
+	double accel_mean;
+	double accel_m2;
+	double accel_min;
+	double accel_max;
+	double gyro_mean;
+	double gyro_max;
+};
 
 struct wmr_headset_descriptor
 {
@@ -73,6 +97,8 @@ struct wmr_hmd
 	//! Absolute accel scale (LSB -> m/s^2): per-device calibration. Per-headset-type
 	//! default, refined by wmr/accel-scale.json in the config dir.
 	float accel_scale;
+
+	struct wmr_imu_diagnostics imu_diagnostics;
 
 	//! Packet reading thread.
 	struct os_thread_helper oth;
@@ -190,6 +216,9 @@ struct wmr_hmd
 	bool have_right_controller_status;
 
 	struct wmr_hmd_controller_connection *controller[WMR_MAX_CONTROLLERS];
+	struct wmr_pending_report pending_reports[WMR_PENDING_REPORT_CAPACITY];
+	uint32_t pending_report_head;
+	uint32_t pending_report_count;
 
 	struct t_constellation_tracker *controller_tracker;
 };
@@ -223,7 +252,11 @@ wmr_hmd_create(enum wmr_headset_type hmd_type,
 bool
 wmr_hmd_send_controller_packet(struct wmr_hmd *hmd, const uint8_t *buffer, uint32_t buf_size);
 int
-wmr_hmd_read_sync_from_controller(struct wmr_hmd *hmd, uint8_t *buffer, uint32_t buf_size, int timeout_ms);
+wmr_hmd_read_sync_from_controller(struct wmr_hmd *hmd,
+                                  uint8_t hmd_cmd_base,
+                                  uint8_t *buffer,
+                                  uint32_t buf_size,
+                                  int timeout_ms);
 
 struct t_constellation_tracked_device_connection *
 wmr_hmd_add_tracked_controller(struct wmr_hmd *hmd,

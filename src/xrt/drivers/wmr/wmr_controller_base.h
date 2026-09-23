@@ -225,10 +225,12 @@ wmr_controller_base_init(struct wmr_controller_base *wcb,
 void
 wmr_controller_base_deinit(struct wmr_controller_base *wcb);
 
+//! Status-only packets still update the hardware clock, but only valid measurements update IMU state.
 void
 wmr_controller_base_imu_sample(struct wmr_controller_base *wcb,
                                struct wmr_controller_base_imu_sample *imu,
-                               timepoint_ns rx_mono_ns);
+                               timepoint_ns rx_mono_ns,
+                               bool imu_valid);
 
 static inline void
 wmr_controller_connection_receive_bytes(struct wmr_controller_connection *wcc,

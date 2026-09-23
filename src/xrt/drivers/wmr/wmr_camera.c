@@ -34,12 +34,16 @@
 #include <libusb.h>
 #include <stdlib.h>
 #include <assert.h>
+#include <stdio.h>
 
 //! Specifies whether the user wants to enable autoexposure from the start.
 DEBUG_GET_ONCE_BOOL_OPTION(wmr_autoexposure, "WMR_AUTOEXPOSURE", true)
 
 //! Specifies whether the user wants to use the same exp/gain values for all cameras
 DEBUG_GET_ONCE_BOOL_OPTION(wmr_unify_expgain, "WMR_UNIFY_EXPGAIN", false)
+
+//! Optional, single local diagnostic image after autoexposure has settled.
+DEBUG_GET_ONCE_OPTION(wmr_camera_snapshot, "WMR_CAMERA_SNAPSHOT", NULL)
 
 static int
 update_expgain(struct wmr_camera *cam, struct xrt_frame **frames);
@@ -119,6 +123,7 @@ struct wmr_camera
 	uint32_t frame_width, frame_height;
 	uint8_t last_seq;
 	uint64_t last_frame_ts;
+	uint32_t snapshot_slam_frames;
 
 	/*! Device-clock plausibility guard over the footer start_ts. One guard for the whole
 	 * stream: SLAM and controller transfers share one crystal-monotonic device clock
@@ -482,6 +487,21 @@ img_xfer_cb(struct libusb_transfer *xfer)
 	 */
 	if (libusb_submit_transfer(xfer) == 0) {
 		resubmitted = true;
+	}
+
+	const char *snapshot_path = debug_get_option_wmr_camera_snapshot();
+	if (slam_tracking_frame && snapshot_path != NULL && ++cam->snapshot_slam_frames == 90) {
+		FILE *image = fopen(snapshot_path, "wb");
+		if (image != NULL) {
+			fprintf(image, "P5\n%u %u\n255\n", xf->width, xf->height - 1);
+			for (uint32_t row = 1; row < xf->height; row++) {
+				fwrite(xf->data + row * xf->stride, 1, xf->width, image);
+			}
+			fclose(image);
+			WMR_CAM_INFO(cam, "Saved diagnostic camera snapshot to %s", snapshot_path);
+		} else {
+			WMR_CAM_WARN(cam, "Cannot write diagnostic camera snapshot to %s", snapshot_path);
+		}
 	}
 
 	/* Push to the appropriate debug output based on frame type */
