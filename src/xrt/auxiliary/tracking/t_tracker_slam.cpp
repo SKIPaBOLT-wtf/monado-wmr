@@ -34,6 +34,7 @@
 
 #include "tracking/t_euroc_recorder.h"
 #include "tracking/t_openvr_tracker.h"
+#include "tracking/t_slam_feature_support.hpp"
 #include "tracking/t_tracking.h"
 #include "tracking/t_vit_loader.h"
 #include "tracking/t_dead_reckoning.h"
@@ -160,6 +161,12 @@ struct feature_count_sample
 	vector<int> counts;
 };
 
+struct feature_support_sample
+{
+	timepoint_ns ts;
+	vector<t_slam_feature_support> cameras;
+};
+
 struct gyro_bias_sample
 {
 	timepoint_ns ts;
@@ -180,6 +187,18 @@ operator<<(ostream &os, const feature_count_sample &s)
 	os << s.ts;
 	for (int count : s.counts) {
 		os << "," << count;
+	}
+	os << CSV_EOL;
+	return os;
+}
+
+ostream &
+operator<<(ostream &os, const feature_support_sample &s)
+{
+	os << s.ts;
+	for (const auto &camera : s.cameras) {
+		os << "," << camera.available << "," << camera.count << "," << camera.finite_count << ","
+		   << camera.major_rms << "," << camera.minor_rms;
 	}
 	os << CSV_EOL;
 	return os;
@@ -266,6 +285,23 @@ struct FeaturesWriter : public CSVWriter<feature_count_sample>
 		column_names.push_back("timestamp");
 		for (size_t i = 0; i < cam_count; i++) {
 			column_names.push_back("cam" + to_string(i) + " feature count");
+		}
+	}
+};
+
+struct FeatureSupportWriter : public CSVWriter<feature_support_sample>
+{
+	FeatureSupportWriter(const string &dir, bool enabled, size_t cam_count)
+	    : CSVWriter<feature_support_sample>(dir, "feature-support.csv", enabled)
+	{
+		column_names.push_back("timestamp [ns]");
+		for (size_t i = 0; i < cam_count; ++i) {
+			string prefix = "cam" + to_string(i) + " ";
+			column_names.push_back(prefix + "available");
+			column_names.push_back(prefix + "count");
+			column_names.push_back(prefix + "finite_uv_count");
+			column_names.push_back(prefix + "major_rms [VIT u/v units]");
+			column_names.push_back(prefix + "minor_rms [VIT u/v units]");
 		}
 	}
 };
@@ -377,6 +413,7 @@ struct TrackerSlam
 	// CSV writers for offline analysis (using pointers because of container_of)
 	TimingWriter *slam_times_writer;      //!< Timestamps of the pipeline for performance analysis
 	FeaturesWriter *slam_features_writer; //!< Feature tracking information for analysis
+	FeatureSupportWriter *feature_support_writer; //!< Diagnostic projected-landmark spread at raw pose time.
 	CSVWriter<gyro_bias_sample> *gyro_bias_writer; //!< Optional diagnostics; no fitted or synthetic bias.
 	TrajectoryWriter *slam_traj_writer;   //!< Estimated poses from the SLAM system
 	TrajectoryWriter *pred_traj_writer;   //!< Predicted poses
@@ -983,6 +1020,18 @@ flush_poses_locked(TrackerSlam &t)
 		if (t.features.enabled) {
 			vector feat_count = features_ui_push(t, pose, nts);
 			t.slam_features_writer->push({nts, feat_count});
+		}
+		if (t.feature_support_writer->enabled) {
+			feature_support_sample support{nts, {}};
+			for (uint32_t i = 0; i < t.cam_count; ++i) {
+				vit_pose_features features{};
+				if (t.features.enabled && t.vit.pose_get_features(pose, i, &features) == VIT_SUCCESS) {
+					support.cameras.push_back(t_slam_summarize_feature_support(features));
+				} else {
+					support.cameras.emplace_back(); // Unavailable is distinct from zero observations.
+				}
+			}
+			t.feature_support_writer->push(support);
 		}
 
 		t.vit.pose_destroy(pose);
@@ -1641,6 +1690,7 @@ t_slam_node_destroy(struct xrt_frame_node *node)
 	delete t.gt.trajectory;
 	delete t.slam_times_writer;
 	delete t.slam_features_writer;
+	delete t.feature_support_writer;
 	delete t.gyro_bias_writer;
 	delete t.slam_traj_writer;
 	delete t.pred_traj_writer;
@@ -1822,6 +1872,7 @@ t_slam_create(struct xrt_frame_context *xfctx,
 	string dir = config->csv_path;
 	t.slam_times_writer = new TimingWriter(dir, "timing.csv", write_csvs, t.timing.columns);
 	t.slam_features_writer = new FeaturesWriter(dir, "features.csv", write_csvs, t.cam_count);
+	t.feature_support_writer = new FeatureSupportWriter(dir, write_csvs, t.cam_count);
 	t.gyro_bias_writer = new CSVWriter<gyro_bias_sample>(dir, "gyro-bias.csv", write_csvs,
 	    {"timestamp", "valid", "gyro_bias_x_rad_s", "gyro_bias_y_rad_s", "gyro_bias_z_rad_s"});
 	t.slam_traj_writer = new TrajectoryWriter(dir, "tracking.csv", write_csvs);

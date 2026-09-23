@@ -20,6 +20,7 @@ set(tests
     tests_quat_swing_twist
     tests_rational
     tests_relation_chain
+	tests_slam_feature_support
     tests_vector
     tests_worker
     tests_pose
@@ -96,6 +97,7 @@ target_link_libraries(tests_quat_change_of_basis PRIVATE aux_math)
 target_link_libraries(tests_quat_swing_twist PRIVATE aux_math)
 target_link_libraries(tests_vec3_angle PRIVATE aux_math)
 target_link_libraries(tests_visibility_mask PRIVATE aux_math)
+target_include_directories(tests_slam_feature_support PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src/external/vit_includes)
 # Recorded-head-stream fixture (b2_reanchor_head_streams.bin, generated from the B2 design's
 # reference simulator); the test warns + skips the recorded-stream sections if it is absent.
 target_compile_definitions(tests_world_reanchor PRIVATE G2_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")

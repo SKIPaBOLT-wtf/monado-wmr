@@ -14,6 +14,7 @@ The source retains the G2 display/90 Hz and native SteamVR path and public contr
 - Controller frontend optical caches now follow the same rigid-world change as the estimator. Untracked masks expire using the existing 150 ms optical freshness horizon. Synthetic full-SE3 tests establish frame invariance; the most recent live capture did not exercise a populated controller cache.
 - Zero current visual observations can produce invalid tracking rather than a trusted-looking extrapolation. Positive observation counts are not a complete quality metric.
 - A gyro-only optional VIT bias consumer binds bias to the exact accepted pose timestamp and factory-calibration path. It is compiled but disabled by default because the rebuilt backend is not qualified.
+- An opt-in `SLAM_WRITE_CSVS` diagnostic writes per-camera projected-landmark count and two-axis spread beside the same raw VIT pose timestamp. Missing feature data and zero features are distinct. This does not change pose validity or fusion and is not a confidence score.
 
 ## Unresolved
 
@@ -24,6 +25,7 @@ The source retains the G2 display/90 Hz and native SteamVR path and public contr
 5. A room/floor origin can correct a constant room placement error, but cannot repair raw visual-inertial drift. Do not hide a drifting tracker with repeated recentering.
 6. The Windows investigation compared specific calibration and driver evidence; it did not reproduce all proprietary Microsoft fusion/filtering mechanisms.
 7. The GNU ld Basalt rebuilds diverged on a recording where the installed upstream release remained bounded. In the companion `2026-09-23-basalt-linker-parity` iteration, mold 2.40.4 relinks of the same compiled objects matched all 2,553 release rows on that input. The old GNU ld artifacts remain rejected, and the mold-linked test outputs are not deployment-qualified. Do not enable the optional gyro-bias consumer from this offline result.
+8. The lit divergence recording has feature counts but no landmark coordinates. The new feature-support diagnostic is source-tested and staged only; no matched live recording or physical comfort verdict exists for it.
 
 ## Default policy
 
